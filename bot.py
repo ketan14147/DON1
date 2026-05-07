@@ -11,8 +11,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ============ CONFIG ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 0))] # Replace 0 with your admin ID
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8576723884:AAFBd3WYuHVqTtFp-qvtRh3uFJoq_Q5zomQ)
+ADMIN_IDS = [int(os.environ.get("8210011971", 0))] # Replace 0 with your admin ID
 BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001}
 
 # ============ MAX POWER SETTINGS (Railway Limit) ============
