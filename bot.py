@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # ============ CONFIG ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8576723884:8635470675:AAGK8u_0qROyP5TiLXMSWA6yJhjpGAlHreE")
-ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 8210011971))]
+ADMIN_IDS = [int(os.environ.get(ADMIN_IDS = [8210011971]   # ← अपना ID यहाँ लिखें
 BLOCKED_PORTS = {22, 25, 443, 3389, 8700, 9031, 17500, 20000, 20001}
 
 # ============ POWERFUL SETTINGS ============
